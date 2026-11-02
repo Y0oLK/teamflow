@@ -1,6 +1,6 @@
 # TeamFlow — User Journeys & System Workflows
 
-**Document Version:** 1.2.0 (Architecturally Audited & Client-Approved)  
+**Document Version:** 1.2.1 (Final Requirements Verification)  
 **Specification Standard:** Aligned with IEEE 830 / ISO/IEC/IEEE 29148  
 **Audit Report:** [`requirements-review-report.md`](./requirements-review-report.md)  
 **Traceability Matrix:** [`traceability-matrix.md`](./traceability-matrix.md)
@@ -176,7 +176,7 @@ sequenceDiagram
 
 ---
 
-## 4. Journey 4: Task Lifecycle & Kanban Board Workflow (Decision Q3: String Fractional Indexing)
+## 4. Journey 4: Task Lifecycle & Kanban Board Workflow (String Fractional Indexing & Concurrency)
 
 ### User Story
 > As an engineer, I want to drag my task across columns on the Kanban board with instant visual feedback, having status changes persisted atomically with string-based ordering keys and synced live to teammates.
@@ -206,7 +206,7 @@ stateDiagram-v2
     end note
 ```
 
-### 4.2 Optimistic Drag-and-Drop Sequence with String Fractional Indexing & Optimistic Concurrency
+### 4.2 Optimistic Drag-and-Drop Sequence with String Fractional Indexing & Crash Recovery
 
 ```mermaid
 sequenceDiagram
@@ -215,7 +215,7 @@ sequenceDiagram
     actor DevB as Developer B
     participant UI_A as Dev A Browser (Kanban)
     participant API as NestJS Tasks Controller
-    participant DB as PostgreSQL
+    participant DB as PostgreSQL (Source of Truth)
     participant Redis as Redis Pub/Sub
     participant Gateway as Socket.IO Gateway
     participant UI_B as Dev B Browser (Kanban)
@@ -232,20 +232,27 @@ sequenceDiagram
     alt Version mismatch (Task was modified concurrently by another user)
         API->>DB: ROLLBACK Transaction
         API-->>UI_A: 409 Conflict { errorCode: "CONCURRENT_MODIFICATION" }
-        UI_A->>UI_A: Revert card to original column and position; toast "Task was updated by another user"
+        UI_A->>UI_A: Revert card to original position; toast "Task was updated by another user"
     else Version matches
         API->>DB: INSERT TaskStatusHistory (taskId=104, old='TODO', new='IN_PROGRESS', actor=DevA)
         API->>DB: INSERT ActivityLog (actorId=DevA, action='TASK_STATUS_CHANGED')
-        API->>DB: COMMIT Transaction (Phase 1 Complete)
+        API->>DB: COMMIT Transaction (Phase 1 Complete - Authoritative)
 
         Note over API,Redis: Phase 2: Post-Commit Best-Effort Broadcast
-        API->>Redis: Publish ("project:10": "task.status_changed", { taskId: 104, newStatus: "IN_PROGRESS", orderKey: "a1V", version: 4 })
-        API-->>UI_A: 200 OK { success: true, updatedTask }
-
-        Note over Redis,UI_B: Phase 3: Client Event Delivery
-        Redis->>Gateway: Relay published event
-        Gateway->>UI_B: WebSocket emit("task.status_changed", payload)
-        UI_B->>UI_B: Animate Task #104 moving to "IN_PROGRESS" slot "a1V" without refresh
+        alt Server crashes or Redis drops before publish
+            Note over Redis,Gateway: Event lost!
+            Note over UI_B: Dev B tabs into window -> Window Focus Sync fires!
+            UI_B->>API: GET /api/v1/projects/10/board?since=T0
+            API->>DB: Query tasks where projectId=10 AND updatedAt > T0
+            DB-->>API: Return Task #104 (status: IN_PROGRESS, orderKey: a1V)
+            API-->>UI_B: 200 OK (Dev B UI reconciles from PostgreSQL source of truth)
+        else Normal publish
+            API->>Redis: Publish ("project:10": "task.status_changed", payload)
+            API-->>UI_A: 200 OK { success: true, updatedTask }
+            Redis->>Gateway: Relay published event
+            Gateway->>UI_B: WebSocket emit("task.status_changed", payload)
+            UI_B->>UI_B: Animate Task #104 moving to "IN_PROGRESS" slot "a1V" without refresh
+        end
     end
 ```
 

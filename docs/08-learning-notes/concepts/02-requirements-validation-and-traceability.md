@@ -1,6 +1,6 @@
 # Engineering Learning Note 02: Requirements Validation, Traceability & Advanced SaaS Architectural Mechanics
 
-**Topic:** Verification vs. Validation, Requirements Consistency Auditing, Traceability Matrices, String-Based Fractional Indexing, Optimistic Concurrency, and Event Delivery Architectures  
+**Topic:** Verification vs. Validation, Requirements Consistency Auditing, Traceability Matrices, String Fractional Indexing, Memory Safety in File Uploads, Real-Time Crash Recovery, and Audit Privacy  
 **Application Context:** TeamFlow Multi-Tenant SaaS Project Management Platform  
 **Target Audience:** Full-Stack Software Engineer (Preparation for Senior Software Architect & Technical Lead Roles)  
 **Governing Standard:** IEEE 830 / ISO/IEC/IEEE 29148 & [`AGENTS.md`](../../../AGENTS.md)  
@@ -12,14 +12,14 @@
 
 In this architectural audit and hardening phase of TeamFlow, we executed a comprehensive **Requirements Validation, Consistency Audit, and Architectural Hardening**:
 
-1. **Reconciled Requirements Specification ([`requirements.md`](../../00-project-overview/requirements.md)):** Re-issued version 1.2.0 incorporating the 6 approved architecture decisions (Q1–Q6) and hardening 7 critical technical areas (Kanban concurrency, layered authorization, anti-lockout rate limiting, file upload security, real-time event reliability, exact analytics formulas, and phased release planning).
-2. **Reconciled User Journeys & Workflows ([`user-journeys-and-workflows.md`](../../00-project-overview/user-journeys-and-workflows.md)):** Updated sequence and state diagrams for creator-to-PM assignment, string fractional indexing, optimistic version conflicts, and guest moderation.
+1. **Authoritative Requirements Specification ([`requirements.md`](../../00-project-overview/requirements.md)):** Re-issued version 1.2.1 incorporating the 6 approved architecture decisions (Q1–Q6) and hardening 7 critical technical areas (Kanban concurrency, layered authorization, anti-lockout rate limiting, memory-safe file upload pipelines, real-time event crash recovery, exact analytics formulas, and provisional release planning).
+2. **Reconciled User Journeys & Workflows ([`user-journeys-and-workflows.md`](../../00-project-overview/user-journeys-and-workflows.md)):** Updated sequence and state diagrams for creator-to-PM assignment, string fractional indexing, optimistic version conflicts, crash recovery sync, and guest moderation.
 3. **Four-Stage Requirements Traceability Matrix ([`traceability-matrix.md`](../../00-project-overview/traceability-matrix.md)):** Upgraded the matrix to distinguish between:
-   - *Acceptance Criterion Defined*
-   - *Test Scenario Designed*
-   - *Automated Test Implemented (Currently: Planned)*
-   - *Automated Test Executed (Currently: Pending)*
-4. **Requirements Review & Audit Report ([`requirements-review-report.md`](../../00-project-overview/requirements-review-report.md)):** Formalized the complete decision log, technical evaluations, and requirements sign-off checklist.
+   - *Acceptance Criterion Defined* (`Defined`)
+   - *Test Scenario Designed* (`Designed`)
+   - *Automated Test Implemented* (`Planned (Not Implemented)`)
+   - *Automated Test Executed* (`Pending (Not Executed)`)
+4. **Requirements Review & Verification Report ([`requirements-review-report.md`](../../00-project-overview/requirements-review-report.md)):** Formalized the complete decision log, technical evaluations, and requirements sign-off checklist.
 
 ---
 
@@ -30,6 +30,7 @@ Writing software requirements is not an administrative formality; it is the **pr
 Inconsistent requirements create compounding engineering friction:
 - **Ripple Effects:** If the Kanban ordering algorithm is changed from floats to strings *after* the database schema and 500 lines of drag-and-drop code are written, every database migration, SQL query, DTO validation, and frontend sort function must be ripped out and rewritten.
 - **Architectural Debt & Flaky Tests:** Conflating IP throttling with account lockouts creates a severe Denial-of-Service vulnerability where attackers lock out legitimate users.
+- **Memory Safety & OOM Crashes:** Using memory storage for 10MB file uploads under concurrent traffic will crash the Node.js V8 process heap.
 - **Team Misalignment:** Without an exact mathematical formula for "Completion Rate", the frontend developer computes one number, the backend API computes another, and automated integration tests fail intermittently.
 
 ---
@@ -61,9 +62,9 @@ Claiming that a requirement has "test coverage" simply because a test scenario w
 
 ---
 
-## 4. Deep Technical Analysis of the 7 Key Corrections
+## 4. Deep Technical Analysis of Hardened Architecture Mechanics
 
-### 4.1 String-Based Fractional Indexing vs. Floating-Point Numbers
+### 4.1 String-Based Fractional Indexing, Duplicate Keys & Tie-Breaking
 
 #### The Original Problem
 The initial draft specified Kanban card ordering as floating-point numbers:
@@ -72,9 +73,8 @@ $$\text{newOrder} = \frac{\text{prevOrder} + \text{nextOrder}}{2}$$
 #### Why It Matters (IEEE 754 Precision Exhaustion)
 JavaScript `Number` and PostgreSQL `double precision` adhere to IEEE 754 double-precision floating-point format, providing exactly **53 bits of mantissa** (~15–17 decimal digits of precision).
 
-If users repeatedly insert cards at the top or between the same two items:
+If users repeatedly insert cards between the same two items:
 - Insertion 1: $\Delta = 0.5$
-- Insertion 20: $\Delta = 9.5 \times 10^{-7}$
 - Insertion 53: $\Delta = 1.1 \times 10^{-16}$
 - Insertion 54: $\Delta < 2.22 \times 10^{-16}$ (Machine $\epsilon$)
 
@@ -88,56 +88,23 @@ We discarded floating-point numbers and adopted **string-based fractional indexi
 - Given keys `"a0"` and `"a0V"`, the generator produces `"a0F"`.
 - As cards are inserted, the string key simply grows in length by 1 character. Because strings have no fixed bit length, precision is theoretically infinite.
 
-```typescript
-// Practical Base-62 Fractional Indexing Concept
-export class FractionalIndexer {
-  private static readonly BASE_DIGITS = '0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz';
+#### Duplicate Keys & Deterministic Tie-Breaking
+If two users simultaneously drop two *different* tasks between `"a1"` and `"a2"`, both tasks may be assigned the identical key `"a1V"`.
+To guarantee deterministic ordering without unique key constraint violations, all queries and UI renders strictly enforce:
+$$\text{ORDER BY orderKey ASC, id ASC}$$
+Because `id` is an immutable UUIDv4, the relative position between the two cards is 100% deterministic across all clients.
 
-  // Generates a string lexicographically strictly between prevKey and nextKey
-  static generateMidpoint(prevKey: string | null, nextKey: string | null): string {
-    if (!prevKey && !nextKey) return 'a0';
-    if (!prevKey && nextKey) return this.decrementKey(nextKey);
-    if (prevKey && !nextKey) return this.incrementKey(prevKey);
-
-    // Compute lexicographical intermediate
-    return this.findIntermediate(prevKey!, nextKey!);
-  }
-
-  private static findIntermediate(a: string, b: string): string {
-    // String midpoint logic (e.g. between "a0" and "a1" -> "a0V")
-    // If prefix matches, append intermediate digit from base-62 character set
-    return a + 'V';
-  }
-
-  private static incrementKey(key: string): string {
-    return key + 'z';
-  }
-
-  private static decrementKey(key: string): string {
-    return key.slice(0, -1) + '0';
-  }
-}
-```
-
-#### Trade-offs & Rebalancing
-- *Advantage:* Zero floating-point mantissa underflow; $O(1)$ fast drops without updating surrounding rows.
-- *Disadvantage:* Keys grow in byte size over time (e.g. 50 insertions can yield a 50-byte string).
-- *Solution:* An automatic column rebalancing routine is triggered when any key exceeds 64 bytes, atomically re-spacing all column cards by uniform 2-character keys (`"a0"`, `"a1"`, `"a2"`...) within an exclusive lock transaction.
-- *Testing Strategy:* Unit test generating 100 consecutive midpoints between `"a0"` and `"a0V"`, asserting strictly ascending lexicographical order (`k1 < k2 < k3...`).
-- *Release:* **Release 1.0 (MVP Core)**.
+#### Atomic Column Rebalancing
+When any card's key length exceeds 64 characters, an atomic transaction rebalances the column:
+- An exclusive row-level lock is acquired on the target column:
+  `SELECT id FROM tasks WHERE projectId = :pId AND status = :status AND deletedAt IS NULL ORDER BY orderKey, id FOR UPDATE`
+- Cards are re-spaced with clean uniform 2-character keys (`"a0"`, `"a1"`, `"a2"`...).
+- Concurrent card moves into that column wait for the lock to release, guaranteeing serial consistency.
 
 ---
 
 ### 4.2 Optimistic Concurrency Control vs. Pessimistic Locking
-
-#### The Original Problem
-The initial draft claimed that fractional indexing eliminated concurrency conflicts.
-
-#### Why It Matters
-Fractional indexing solves key generation, but it does **not** solve concurrent mutations. If User A moves Task #104 from `TODO` to `IN_PROGRESS`, while User B simultaneously moves Task #104 from `TODO` to `DONE`, User B's update would blindly overwrite User A's status change if no concurrency control exists.
-
-#### The Chosen Solution (Optimistic Concurrency via Versioning)
-Instead of using heavy pessimistic database locks (`SELECT ... FOR UPDATE`) that block other readers and destroy throughput, we implement **Optimistic Concurrency Control (OCC)**:
+Instead of using heavy pessimistic database locks (`SELECT ... FOR UPDATE`) that block readers and destroy throughput, we implement **Optimistic Concurrency Control (OCC)**:
 1. Every `Task` entity contains an integer `version` field (starts at 1).
 2. The client fetches Task #104 (`version: 3`).
 3. When dragging the card, the client sends `{ newStatus: "IN_PROGRESS", orderKey: "a1V", version: 3 }`.
@@ -151,131 +118,98 @@ Instead of using heavy pessimistic database locks (`SELECT ... FOR UPDATE`) that
 6. The transaction detects 0 rows updated, rolls back, and returns **HTTP 409 Conflict**.
 7. The client catches the 409, animates the card back to its previous position, and alerts the user: *"Task was modified by another user."*
 
+---
+
+### 4.3 File Upload Memory Safety: `multer.diskStorage` vs. `multer.memoryStorage`
+
+#### The Problem with `memoryStorage`
+In Node.js, `multer.memoryStorage()` buffers incoming file payloads directly into V8 heap memory as raw `Buffer` instances.
+- If 20 concurrent users upload 10MB files simultaneously, the process allocates $>200\text{ MB}$ of contiguous heap buffers.
+- In containerized environments with memory limits (e.g. 512MB RAM in Docker), high concurrency triggers V8 garbage collection pauses, event loop starvation, and sudden process termination due to **Out-Of-Memory (OOM)**.
+
+#### The Safe Architecture (`multer.diskStorage` with Temporary Spooling)
+TeamFlow utilizes disk storage spooling with guaranteed cleanup:
 ```typescript
-// NestJS Optimistic Concurrency Service Example
-async moveTask(taskId: string, newStatus: TaskStatus, newOrderKey: string, expectedVersion: number): Promise<Task> {
-  return this.prisma.$transaction(async (tx) => {
-    const result = await tx.task.updateMany({
-      where: {
-        id: taskId,
-        version: expectedVersion, // Conditional write check
-      },
-      data: {
-        status: newStatus,
-        orderKey: newOrderKey,
-        version: { increment: 1 },
-      },
-    });
-
-    if (result.count === 0) {
-      // Concurrency collision! Another transaction updated this task first
-      throw new ConflictException({
-        errorCode: 'CONCURRENT_MODIFICATION',
-        message: 'The task has been updated by another user. Please refresh and try again.',
-      });
-    }
-
-    // Atomically log status history and activity
-    await tx.taskStatusHistory.create({ ... });
-    await tx.activityLog.create({ ... });
-
-    return tx.task.findUnique({ where: { id: taskId } });
-  });
-}
+// Safe Multer Spooling Configuration
+const upload = multer({
+  storage: multer.diskStorage({
+    destination: '/tmp/teamflow-uploads',
+    filename: (req, file, cb) => cb(null, `${randomUUID()}.tmp`),
+  }),
+  limits: {
+    fileSize: 10 * 1024 * 1024, // Strict 10MB hard limit
+    files: 1,
+  },
+});
 ```
 
-- *Testing Strategy:* Integration test executing two simultaneous `PATCH /tasks/:id/status` requests against the same task version using `Promise.all()`. Assert that exactly one succeeds (200 OK) and one fails (409 Conflict).
-- *Release:* **Release 1.0 (MVP Core)**.
+1. **Chunked Disk Spooling:** Files stream from the network socket directly to `/tmp/teamflow-uploads/` in small OS buffer chunks. Node.js heap memory usage remains negligible ($< 64\text{ KB}$ per upload regardless of file size).
+2. **In-Flight Validation:** The backend opens the temporary file descriptor, reads the first 512 bytes using `file-type`, and verifies the true binary magic bytes against the allowlist.
+3. **Stream Pipeline to S3:** If valid, the file streams from disk to S3/MinIO via `fs.createReadStream()`.
+4. **Guaranteed Temp Cleanup:** The temporary file is unconditionally deleted (`fs.unlink()`) inside a `finally` block:
+   ```typescript
+   try {
+     await this.storageService.streamToS3(tempFilePath, s3Key);
+   } finally {
+     await fs.promises.unlink(tempFilePath).catch(() => {});
+   }
+   ```
+
+#### Presigned Download URL Expiration & Security
+- Presigned download URLs expire strictly after **15 minutes (900 seconds)** (`X-Amz-Expires=900`). Requests after 900s are rejected by S3 with 403 Forbidden.
+- To prevent proxy caching of sensitive documents, responses enforce `Cache-Control: private, no-store, max-age=0`.
+- To prevent stored XSS (e.g. an attacker uploading an `.html` or `.svg` file disguised as a document), responses enforce `Content-Disposition: attachment; filename="..."` and `X-Content-Type-Options: nosniff`, forcing the browser to download the file rather than execute it inline.
 
 ---
 
-### 4.3 Multi-Tenant Layered Defense-in-Depth vs. PostgreSQL RLS
+### 4.4 Real-Time Crash Recovery: PostgreSQL as the Single Source of Truth
 
-#### The Original Problem
-Relying on a single interceptor or query filter creates a single point of failure: a single forgotten `where: { organizationId }` exposes sensitive data.
+#### The Failure Scenario
+In the MVP, event emission occurs post-commit:
+1. $T_1$: PostgreSQL commits task status change.
+2. $T_1 + 1\text{ms}$: The backend server process crashes, or Redis connection drops before `redis.publish()` executes.
+3. Result: The event is lost; connected clients do not receive a WebSocket push.
 
-#### The Chosen Solution (6-Layer Authorization Framework)
-We implemented a strict layered model:
-- Layer 1: JWT Session Authenticated.
-- Layer 2: Organization Membership Active.
-- Layer 3: Organization Role Verified (`ORG_OWNER`, `ORG_ADMIN`, `ORG_MEMBER`, `ORG_GUEST`).
-- Layer 4: Private Project Membership Verified (`ProjectMember` check).
-- Layer 5: Programmatic Query Scoping (`where: { organizationId, projectId }`).
-- Layer 6: WebSocket Room & Pre-Signed Token Scoping.
-
-#### Trade-off Analysis: PostgreSQL Row-Level Security (RLS) with Prisma
-- *Why RLS is Attractive:* PostgreSQL native RLS guarantees that even if a developer writes `SELECT * FROM tasks`, the database engine automatically restricts returned rows to `current_setting('app.current_org_id')`.
-- *Why RLS Conflicts with Prisma / PgBouncer in Production:*  
-  Prisma manages an internal connection pool, and production databases typically run behind PgBouncer in `transaction` mode. In pooled environments:
-  - If Connection #1 executes `SET LOCAL app.current_org_id = 'org_abc'`, and the connection is returned to the pool without being properly reset, Connection #1 could subsequently serve a query for Tenant XYZ.
-  - Setting session variables on every query requires wrapping every read in an explicit transaction (`$transaction`), doubling database roundtrips and degrading read latency.
-- *Architectural Decision:* Programmatic Layer 5 scoping in NestJS repositories is our **mandatory primary control**. Native PostgreSQL RLS is documented as a future hardening option for dedicated database connections.
-- *Testing Strategy:* Automated penetration test suite (`tenant-isolation.e2e-spec.ts`) attempting cross-tenant reads, updates, and deletes across every API endpoint, asserting 403 Forbidden.
-- *Release:* **Release 1.0 (MVP Core)**.
+#### The Crash Recovery Protocol
+Because PostgreSQL is the **sole authoritative source of truth**, state is never lost. Clients recover automatically via three fallback mechanisms:
+1. **Window Focus Sync:** When a user switches tabs or focuses the browser window (`document.visibilityState === 'visible'`), the frontend fires a delta sync:
+   `GET /api/v1/projects/:id/board?since=<lastSyncTimestamp>`
+2. **Periodic Heartbeat Sync:** Every 60 seconds, active board clients execute a lightweight background check.
+3. **Socket Reconnect Sync:** When the Socket.IO client auto-reconnects, it immediately reconciles board state.
+4. **Outbox Pattern Upgrade Path (v1.2):** For guaranteed at-least-once event delivery, an `outbox_events` table will be introduced in release v1.2, writing events in the same ACID transaction as the entity mutation.
 
 ---
 
-### 4.4 Anti-Lockout Rate Limiting vs. DoS Vulnerabilities
+### 4.5 Audit Log Retention, Hygiene & Privacy (GDPR / CCPA)
 
-#### The Original Problem
-Locking a user account after 5 failed password attempts allows malicious actors to launch a distributed Denial-of-Service attack: an attacker writes a script that attempts 5 bad passwords for every executive's email address, locking the entire leadership team out of their company accounts.
+#### Why "Permanent Retention" is a Compliance Liability
+Stating that audit logs are "permanently retained" violates GDPR Article 5(1)(e) (Storage Limitation Principle), which mandates that personal data be kept in a form which permits identification of data subjects for no longer than is necessary.
 
-#### The Chosen Solution (Two-Tier Progressive Delay)
-- **Tier 1 (IP-Based Request Throttling):** A Redis sliding window limits requests to **10 req/min per IP address**. This blocks high-frequency volumetric dictionary attacks.
-- **Tier 2 (Progressive Account Cooldown):**
-  - Failures 1–3: Immediate generic 401 response (`"Invalid email or password"`).
-  - Failures 4–9: The backend injects a progressive server-side artificial delay (1 second up to 5 seconds) before responding with 401. This reduces automated attack throughput from 1,000 attempts/second to 0.2 attempts/second without locking out legitimate users.
-  - Failures 10+: The specific `(IP + email)` pairing is placed on a 15-minute cooldown. The account is **never globally locked**: existing active sessions continue working normally.
-- *Testing Strategy:* Integration test sending 15 rapid failed requests from IP 1; assert artificial delay increases, IP 1 is throttled, but a login from IP 2 with correct password succeeds immediately.
-- *Release:* **Release 1.0 (MVP Core)**.
-
----
-
-### 4.5 Real-Time Reliability: Commit vs. Publish vs. Delivery & The Outbox Pattern
-
-#### The Original Problem
-Conflating database transactions with WebSocket emissions leads to ghost data or missed events:
-- If an event is emitted *before* the database commits, other users receive an update for a task that rolls back on disk (ghost state).
-- If the database commits, but Redis crashes or the client is temporarily in an elevator, the client misses the event and displays stale data until page refresh.
-
-#### The Three Phases of Real-Time Collaboration
-1. **Phase 1: Database Commit (PostgreSQL):** Authoritative state mutation.
-2. **Phase 2: Event Publication (Redis Pub/Sub):** Cross-instance message relay.
-3. **Phase 3: Client Delivery (Socket.IO):** Transport over persistent WebSocket connection.
-
-```mermaid
-flowchart TD
-    subgraph TransactionalOutboxPattern ["Transactional Outbox Pattern (Cataloged for v1.2)"]
-        direction TB
-        T1["API Service receives Mutation"] --> T2["BEGIN PostgreSQL Transaction"]
-        T2 --> T3["UPDATE tasks (status='IN_PROGRESS')"]
-        T3 --> T4["INSERT INTO outbox_events\n(aggregateType='TASK', payload=JSON, status='PENDING')"]
-        T4 --> T5["COMMIT Transaction"]
-        T5 --> W1["Asynchronous Outbox Worker\n(Reads pending events using SELECT FOR UPDATE SKIP LOCKED)"]
-        W1 --> W2["Publish to Redis Pub/Sub"]
-        W2 --> W3["UPDATE outbox_events SET status='PUBLISHED'"]
-        W3 --> WS["Socket.IO Gateway relays to connected browsers"]
-    end
-```
-
-#### MVP vs. Outbox Pattern Trade-off
-- **MVP Strategy (Release 1.0):** Post-commit best-effort publishing (`$transaction().then(() => redis.publish())`). To handle missed events during disconnections, reconnecting clients automatically execute a lightweight reconciliation query:
-  $$\text{GET /api/v1/projects/:id/board?since=<lastKnownTimestamp>}$$
-- **Outbox Pattern Strategy (Release 1.2):** Introducing an `outbox_events` table inside PostgreSQL guarantees that even if Redis or the backend server crashes immediately after a commit, the event is durably recorded on disk and published upon worker recovery (Guaranteed At-Least-Once Delivery).
-- *Release:* **MVP uses Post-Commit + Reconnect Reconciliation; Outbox Pattern scheduled for v1.2**.
+#### The Compliant Audit Architecture
+1. **Defined Retention Window:** Audit logs are retained for **365 days (1 year)** standard compliance retention, after which records are archived or pruned.
+2. **Strict Sensitive Data Prohibition:**
+   - Passwords and password hashes must **never** be logged.
+   - Authentication tokens, session cookies, and reset tokens must **never** be logged.
+   - Financial, cardholder, and banking data must **never** be logged.
+   - Personal comment bodies and task description text must **never** be logged (only entity metadata like title/status is logged).
+3. **Right to Erasure (User Deletion & Pseudonymization):**
+   When a user deletes their account:
+   - Setting `actorId = NULL` or assigning a system pseudonym (e.g. `metadata.actorName = "Former Member"`).
+   - Scrubbing personal identifiers (`email`, `fullName`, `ipAddress`).
+   - The operational audit log remains verifiable and immutable without retaining PII.
 
 ---
 
 ## 5. Technical Interview Questions & Answers
 
-### Q1: "Why did you choose string-based fractional indexing over floating-point indexing for your Kanban board?"
+### Q1: "How do you handle memory safety when accepting large file uploads in Node.js?"
 **Answer:**  
-*"Floating-point division repeatedly halves the distance between adjacent cards. Because double-precision floats in IEEE 754 have exactly 53 bits of mantissa, precision is exhausted after approximately 53 consecutive drops between the same two items. When the delta drops below machine epsilon, rounding produces identical numbers, causing card collisions and non-deterministic sorting. String-based fractional indexing generates variable-length ASCII keys in base-62. As cards are dropped, keys grow in character length, providing infinite precision with zero rounding collisions. We combine this with an atomic rebalancing routine that re-spaces cards if keys exceed 64 characters."*
+*"Buffering uploads into memory using `multer.memoryStorage()` is dangerous because concurrent uploads can easily exhaust the Node.js process heap, triggering V8 garbage collection freezes and Out-Of-Memory (OOM) crashes. To guarantee memory safety, we use `multer.diskStorage()` to spool files to a temporary disk directory in small OS chunks, keeping process heap usage below 64KB per upload. We open the spooled file, read the initial 512 bytes to inspect binary magic bytes against an allowlist, stream the file to S3 via `fs.createReadStream()`, and unconditionally delete the temporary file in a `finally` block."*
 
-### Q2: "How does your multi-tenant SaaS architecture prevent cross-tenant data leaks and handle internal privacy?"
+### Q2: "What happens if your server crashes after committing a transaction but before emitting a WebSocket event?"
 **Answer:**  
-*"We implement a Two-Layer Authorization Barrier. Layer 1 enforces strict tenant isolation: every request authenticates the user's active organization membership via a `TenantGuard`, and every database query explicitly scopes resources by `organizationId`. Layer 2 enforces intra-company privacy: because projects are private by default, a `ProjectGuard` checks that the user is an explicit `ProjectMember` before granting access to tasks or boards. This ensures that an employee in Company A cannot see Company B's data (Layer 1), and cannot see private executive projects within Company A unless assigned (Layer 2)."*
+*"In our MVP architecture, PostgreSQL is the single source of truth, and event emission is best-effort post-commit. If the server crashes before publishing to Redis, the database state remains committed and durable. Connected clients recover from dropped events through client-side reconciliation: whenever a user switches back to the tab (`document.visibilityState === 'visible'`), reconnects a dropped socket, or reaches the 60-second heartbeat interval, the frontend queries `GET /projects/:id/board?since=<timestamp>` to synchronize any delta changes. For release v1.2, we have cataloged the Transactional Outbox Pattern to guarantee at-least-once event publication even across process crashes."*
 
-### Q3: "What is the Transactional Outbox Pattern, and why would you use it with WebSockets?"
+### Q3: "How does your multi-tenant SaaS handle audit logging while complying with GDPR Right to Erasure?"
 **Answer:**  
-*"In a distributed architecture, updating a database and publishing a message to a broker like Redis are two separate operations. If the database commits but the network or broker fails during publish, the event is lost forever (dual-write problem). The Transactional Outbox Pattern solves this by storing outbound events in an `outbox_events` table inside the same database transaction that updates the business entity. Because both writes occur in the same ACID transaction, the event is guaranteed to be persisted. An asynchronous background worker polls or streams the outbox table, publishes the message to Redis/Socket.IO, and marks it published. This guarantees at-least-once event delivery across real-time systems."*
+*"We enforce strict data hygiene: audit logs record operational metadata (action type, entity ID, timestamp) but strictly prohibit logging passwords, auth tokens, or personal message bodies. To comply with GDPR storage limitation, logs follow a defined 365-day retention policy rather than indefinite storage. When a user exercises their Right to Erasure, we do not delete audit records—which would compromise operational integrity—but instead pseudonymize them: the `actorId` is disassociated or set to null, personal metadata (name, email, IP) is scrubbed, and the record references a generic 'Former Member' pseudonym."*
