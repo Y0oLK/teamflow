@@ -1,11 +1,11 @@
 # TeamFlow — User Journeys & System Workflows
 
-**Document Version:** 1.1.0 (Audited & Reconciled)  
+**Document Version:** 1.2.0 (Architecturally Audited & Client-Approved)  
 **Specification Standard:** Aligned with IEEE 830 / ISO/IEC/IEEE 29148  
 **Audit Report:** [`requirements-review-report.md`](./requirements-review-report.md)  
 **Traceability Matrix:** [`traceability-matrix.md`](./traceability-matrix.md)
 
-This document models the critical user journeys, state transitions, and real-time interaction flows across the **TeamFlow** platform using formal software engineering sequence diagrams and state machines.
+This document models the critical user journeys, state transitions, string-based Kanban ordering interactions, and real-time event flows across the **TeamFlow** platform.
 
 ---
 
@@ -55,8 +55,8 @@ sequenceDiagram
     API->>DB: INSERT Membership (userId, orgId, role="ORG_OWNER")
     API->>DB: INSERT ActivityLog (actorId, action="ORGANIZATION_CREATED")
     API->>DB: COMMIT Transaction
-    API-->>Front: 201 Created (Sets active org cookie)
-    Front-->>User: Redirect to /dashboard
+    API-->>Front: 201 Created (Sets active org cookie & path context)
+    Front-->>User: Redirect to /app/orgs/acme-corp/dashboard
 ```
 
 ---
@@ -95,7 +95,7 @@ sequenceDiagram
 
     Admin->>Front: Invite "dev@acme.com" as "ORG_MEMBER"
     Front->>API: POST /api/v1/organizations/:id/invitations
-    API->>API: Validate Admin has ORG_OWNER or ORG_ADMIN role
+    API->>API: Validate Admin has ORG_OWNER or ORG_ADMIN role (Layer 3 Check)
     API->>DB: INSERT Invitation (email, role, token, expiresAt=now()+7d, status=PENDING)
     API->>Mail: Send Invitation Email with accept/decline links
     API-->>Front: 201 Created (Invitation pending)
@@ -127,16 +127,17 @@ sequenceDiagram
 
 ---
 
-## 3. Journey 3: Project Creation & Member Scoping
+## 3. Journey 3: Project Creation & Member Scoping (Decision Q2: Private by Default)
 
 ### User Story
-> As an Organization Member (or Admin), I want to create a new project and automatically be assigned as its Project Manager, then assign a specific subset of organization members so that sensitive client work remains strictly isolated.
+> As an Organization Member (or Admin), I want to create a new project and automatically be assigned as its Project Manager, then assign a specific subset of organization members so that sensitive client work remains strictly private.
 
 ```mermaid
 sequenceDiagram
     autonumber
     actor Creator as Org Member / Admin
     actor Member as Assigned Colleague (David)
+    actor Guest as Client Collaborator (Elena)
     participant Front as Next.js UI
     participant API as NestJS Projects Controller
     participant Guard as TenantGuard & ProjectGuard
@@ -145,37 +146,42 @@ sequenceDiagram
 
     Creator->>Front: Submit Create Project ("Mobile App v2", dates, description)
     Front->>API: POST /api/v1/organizations/:orgId/projects
-    API->>Guard: Verify Creator is active ORG_OWNER, ORG_ADMIN, or ORG_MEMBER
+    API->>Guard: Verify Creator is active ORG_OWNER, ORG_ADMIN, or ORG_MEMBER (Layer 2 & 3)
     Guard-->>API: Authorized
     API->>DB: BEGIN Transaction
-    API->>DB: INSERT Project (orgId, title, status='PLANNING')
+    API->>DB: INSERT Project (orgId, title, status='PLANNING', isPrivate=true)
     API->>DB: INSERT ProjectMember (projectId, userId=Creator.id, role='PROJECT_MANAGER')
     API->>DB: INSERT ActivityLog (actorId=Creator.id, action='PROJECT_CREATED')
     API->>DB: COMMIT Transaction
     API-->>Front: 201 Created (Creator is now Project Manager of Mobile App v2)
 
-    Note over Creator,Front: Assigning Team Members to Project
+    Note over Creator,Front: Assigning Internal Team Member (CONTRIBUTOR)
 
     Creator->>Front: Add Member (select "David", role="CONTRIBUTOR")
     Front->>API: POST /api/v1/projects/:projectId/members { userId: "david_id", role: "CONTRIBUTOR" }
-    API->>Guard: Verify Creator is PROJECT_MANAGER of this Project (Layer 2 Check)
-    API->>DB: Verify David is active member of parent Organization (Layer 1 Check)
+    API->>Guard: Verify Creator is PROJECT_MANAGER of this Project (Layer 4 Check)
+    API->>DB: Verify David is active member of parent Organization (Layer 2 Check)
     API->>DB: INSERT ProjectMember (projectId, userId=David.id, role='CONTRIBUTOR')
     API->>DB: INSERT Notification (recipient=David, type='PROJECT_ASSIGNED')
     API->>RT: Emit to David's personal room ("notification.created")
     API-->>Front: 200 OK (David added to project)
+
+    Note over Creator,Front: Assigning External Client (Decision Q5: VIEWER)
+
+    Creator->>Front: Add Guest (select "Elena", role="VIEWER")
+    Front->>API: POST /api/v1/projects/:projectId/members { userId: "elena_id", role: "VIEWER" }
+    API->>DB: INSERT ProjectMember (projectId, userId=Elena.id, role='VIEWER')
+    API-->>Front: 200 OK (Elena added as read-only viewer with commenting rights)
 ```
 
 ---
 
-## 4. Journey 4: Task Lifecycle & Kanban Board Workflow
+## 4. Journey 4: Task Lifecycle & Kanban Board Workflow (Decision Q3: String Fractional Indexing)
 
 ### User Story
-> As an engineer, I want to drag my task across columns on the Kanban board with instant visual feedback, having status changes persisted atomically and synced live to teammates.
+> As an engineer, I want to drag my task across columns on the Kanban board with instant visual feedback, having status changes persisted atomically with string-based ordering keys and synced live to teammates.
 
-### 4.1 Reconciled Task Status & Blocker State Machine
-
-The task status enum contains strictly the 6 core operational states defined in the client specification. The "Blocked" condition is modeled dynamically based on unresolved dependencies.
+### 4.1 Task Status State Machine with Dynamic Blocker Modeling
 
 ```mermaid
 stateDiagram-v2
@@ -192,14 +198,15 @@ stateDiagram-v2
     CANCELLED --> [*]
 
     note right of IN_PROGRESS
-      Dynamic Attribute:
+      Dynamic Blocker Attribute:
       isBlocked = true
       when unresolved TaskDependency exists.
-      Displays "Blocked" badge in UI.
+      Task remains in current column
+      displaying visual "Blocked" badge.
     end note
 ```
 
-### 4.2 Optimistic Drag-and-Drop Sequence with Concurrency Protection & Rebalancing
+### 4.2 Optimistic Drag-and-Drop Sequence with String Fractional Indexing & Optimistic Concurrency
 
 ```mermaid
 sequenceDiagram
@@ -213,73 +220,77 @@ sequenceDiagram
     participant Gateway as Socket.IO Gateway
     participant UI_B as Dev B Browser (Kanban)
 
-    Note over DevA,UI_A: Developer A drags Task #104 from "TODO" to "IN_PROGRESS"
-    UI_A->>UI_A: Optimistic UI Update: Move card immediately in DOM
-    UI_A->>API: PATCH /api/v1/tasks/104/status { newStatus: "IN_PROGRESS", prevTaskId: 102, nextTaskId: 105, version: 3 }
+    Note over DevA,UI_A: Dev A drags Task #104 (version: 3) from TODO to IN_PROGRESS between "a1" and "a2"
+    UI_A->>UI_A: Optimistic UI Update: Render card in target slot immediately
+    UI_A->>API: PATCH /api/v1/tasks/104/status { newStatus: "IN_PROGRESS", prevKey: "a1", nextKey: "a2", version: 3 }
     
-    API->>API: Layer 1 & 2 Auth: Verify Dev A has CONTRIBUTOR or PM role in Project
-    API->>API: Calculate new fractional orderIndex: (prev.orderIndex + next.orderIndex) / 2
+    API->>API: Layer 2 & 4 Auth: Verify Dev A has CONTRIBUTOR or PM role in Project
+    API->>API: Generate string intermediate key between "a1" and "a2" -> "a1V"
     
-    alt Precision Gap < 1e-6 (Precision Exhaustion)
-        API->>DB: Auto-Rebalance: Spacing cards in target column by 1000, 2000, 3000...
-    end
-
     API->>DB: BEGIN Transaction
-    API->>DB: UPDATE Task SET status = 'IN_PROGRESS', orderIndex = 4.5, version = 4 WHERE id = 104 AND version = 3
-    alt Version mismatch (Concurrent modification by another user)
+    API->>DB: UPDATE Task SET status = 'IN_PROGRESS', orderKey = 'a1V', version = 4 WHERE id = 104 AND version = 3
+    alt Version mismatch (Task was modified concurrently by another user)
         API->>DB: ROLLBACK Transaction
         API-->>UI_A: 409 Conflict { errorCode: "CONCURRENT_MODIFICATION" }
-        UI_A->>UI_A: Animate card back to previous position; toast "Task was modified by another user"
+        UI_A->>UI_A: Revert card to original column and position; toast "Task was updated by another user"
     else Version matches
         API->>DB: INSERT TaskStatusHistory (taskId=104, old='TODO', new='IN_PROGRESS', actor=DevA)
         API->>DB: INSERT ActivityLog (actorId=DevA, action='TASK_STATUS_CHANGED')
-        API->>DB: COMMIT Transaction
+        API->>DB: COMMIT Transaction (Phase 1 Complete)
 
-        API->>Redis: Publish ("project:10": "task.status_changed", payload)
+        Note over API,Redis: Phase 2: Post-Commit Best-Effort Broadcast
+        API->>Redis: Publish ("project:10": "task.status_changed", { taskId: 104, newStatus: "IN_PROGRESS", orderKey: "a1V", version: 4 })
         API-->>UI_A: 200 OK { success: true, updatedTask }
 
-        Redis->>Gateway: Receive published event
+        Note over Redis,UI_B: Phase 3: Client Event Delivery
+        Redis->>Gateway: Relay published event
         Gateway->>UI_B: WebSocket emit("task.status_changed", payload)
-        UI_B->>UI_B: Animate Task #104 moving to "IN_PROGRESS" column without page refresh
+        UI_B->>UI_B: Animate Task #104 moving to "IN_PROGRESS" slot "a1V" without refresh
     end
 ```
 
 ---
 
-## 5. Journey 5: Real-Time Collaboration & Notification Broadcasting
+## 5. Journey 5: Real-Time Collaboration & Guest Interactions (Decision Q5)
 
 ### User Story
-> As a team member, when someone comments on my assigned task or mentions me, I want to receive an immediate real-time in-app notification without refreshing the page.
+> As a project participant (or guest client), I want to comment on a task, mention colleagues, and receive real-time notifications, while project managers retain comment moderation authority.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor Commenter as Alex (Project Manager)
-    actor Assignee as David (Assigned Developer)
-    participant Front_A as Alex Browser
+    actor Elena as Elena (Guest / Client Viewer)
+    actor PM as Alex (Project Manager)
+    participant Front_E as Elena Browser
     participant API as NestJS Comments Controller
+    participant DB as PostgreSQL
     participant EventBus as NestJS EventEmitter2
     participant Gateway as Realtime WebSocket Gateway
-    participant Front_D as David Browser
+    participant Front_A as Alex Browser
 
-    Commenter->>Front_A: Type comment: "Great progress @david, please review the PR"
-    Front_A->>API: POST /api/v1/tasks/104/comments { content: "Great progress @david..." }
+    Elena->>Front_E: Post comment: "Looks great, but can we change the logo color? @alex"
+    Front_E->>API: POST /api/v1/tasks/104/comments { content: "Looks great..." }
     
+    API->>API: Layer 4 Check: Elena is VIEWER of Project -> Commenting permitted (Decision Q5)
     API->>API: Sanitize markdown HTML with DOMPurify
-    API->>API: Parse mentions: found ["@david"]
-    API->>API: Layer 2 Check: Verify David is active member of Project
+    API->>API: Parse mentions: found ["@alex"]
     
-    API->>API: Save Comment & create Notification records in DB (90-day retention)
-    API->>EventBus: emit("comment.created", { comment, taskId, projectId, mentions })
-    API-->>Front_A: 201 Created (Comment posted)
+    API->>DB: BEGIN Transaction
+    API->>DB: INSERT Comment (taskId=104, authorId=Elena.id, content)
+    API->>DB: INSERT Notification (recipient=Alex.id, actor=Elena.id, type='MENTION')
+    API->>DB: COMMIT Transaction
+    
+    API->>EventBus: emit("comment.created", payload)
+    API-->>Front_E: 201 Created (Elena can edit/delete her own comment)
 
-    EventBus->>Gateway: handleCommentCreatedEvent(payload)
-    
-    par Broadcast to Project Room
-        Gateway->>Gateway: socket.to("project:10").emit("comment.created", comment)
-        Gateway-->>Front_D: Append comment to open task modal in real time
-    and Direct Notification to Mentioned User Room
-        Gateway->>Gateway: socket.to("user:david_id").emit("notification.created", notification)
-        Gateway-->>Front_D: Increment unread bell counter & display Toast: "Alex mentioned you in Task #104"
-    end
+    EventBus->>Gateway: handleCommentCreated(payload)
+    Gateway->>Front_A: WebSocket emit("comment.created") & emit("notification.created")
+    Front_A-->>PM: Display toast: "Elena mentioned you in Task #104"
+
+    Note over PM,Front_A: Moderation Capability (Decision Q5)
+    PM->>Front_A: PM decides to delete inappropriate comment
+    Front_A->>API: DELETE /api/v1/comments/:id
+    API->>API: Layer 4 Check: Alex is PROJECT_MANAGER -> Moderation deletion permitted
+    API->>DB: UPDATE Comment SET deletedAt = NOW()
+    API-->>Front_A: 200 OK (Comment deleted by PM)
 ```

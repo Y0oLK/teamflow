@@ -1,6 +1,6 @@
 # TeamFlow — Software Requirements Specification (SRS)
 
-**Document Version:** 1.1.0 (Audited & Reconciled)  
+**Document Version:** 1.2.0 (Architecturally Audited & Client-Approved)  
 **Specification Standard:** Aligned with IEEE 830 / ISO/IEC/IEEE 29148  
 **Client / Product Owner:** Client Specification (Version 1.0)  
 **Lead Engineer & Architect:** Hamza Jemli  
@@ -11,308 +11,324 @@
 
 ---
 
-## 1. Introduction & Requirements Engineering Principles
+## 1. Introduction & Approved Architecture Directives
 
-### 1.1 Purpose of this Document
-This Software Requirements Specification (SRS) defines the formal functional and non-functional requirements for the **TeamFlow** SaaS platform. Following a formal architectural audit, this revised specification resolves prior ambiguities surrounding RBAC hierarchies, project creation workflows, dependency blocker modeling, rate limiting, and precision handling.
+### 1.1 Purpose & Scope
+This Software Requirements Specification (SRS) defines the authoritative technical and operational contract for the **TeamFlow** multi-tenant SaaS project management platform. 
 
-### 1.2 Requirements Identification Convention
-Every requirement is assigned a permanent identifier:
-- **`FR-xxx`**: Functional Requirement (system behaviors, inputs, state machines, and API outputs).
-- **`NFR-xxx`**: Non-Functional Requirement (security, latency envelopes, reliability, and code constraints).
+This version (1.2.0) incorporates the **six formally approved architectural decisions (Q1–Q6)** and resolves all critical concurrency, rate-limiting, authorization, and event-reliability constraints.
 
-### 1.3 Requirements Prioritization
-Requirements are classified using the MoSCoW framework for Version 1.0:
-- **MUST:** Essential core capability for Version 1.0 delivery.
-- **SHOULD:** High-priority requirement included in v1.0 unless unexpected technical blockers occur.
-- **COULD:** Secondary capability desirable for v1.0 polish.
-- **WON'T (v1):** Explicitly deferred to Version 2.0+ (Out of scope).
+### 1.2 Summary of Approved Architecture Decisions
+1. **Q1 — Workspace Routing:** Path-based workspace routing (`/app/orgs/:slug/...` or `/app/...` with active organization context). The backend independently authenticates and validates membership for every request. Client-supplied IDs are never trusted as proof of access.
+2. **Q2 — Project Visibility:** Private by default. Only explicitly assigned `ProjectMember`s can view or access project resources. `ORG_OWNER` and `ORG_ADMIN` retain administrative override access.
+3. **Q3 — Kanban Card Ordering:** String-based fractional indexing using a deterministic variable-length base-62/base-95 key algorithm. Floating-point indices are discarded. Optimistic concurrency with `version` fields handles simultaneous moves.
+4. **Q4 — Subtask Hierarchy:** Single-level checklist items (`ChecklistItem` / `Subtask`). No nested subtasks. Kept distinct from `TaskDependency`.
+5. **Q5 — Guest Permissions:** Read-only access to assigned projects and tasks with commenting privileges. Guests cannot create/edit tasks, change statuses, or manage members. Guests can edit/delete their own comments; Project Managers can moderate/delete guest comments.
+6. **Q6 — Notification Retention:** 90-day retention for both read and unread notifications, executed via a daily scheduled background job with retries. Audit logs are governed by an independent permanent retention policy.
 
 ---
 
-## 2. Functional Requirements (FR-001 to FR-081)
+## 2. Layered Multi-Tenant Authorization Architecture
+
+Tenant isolation and resource authorization cannot rely on a single filter, interceptor, or client check. TeamFlow implements a **Six-Layer Defense-in-Depth Authorization Strategy**:
 
 ```mermaid
 flowchart TD
-    subgraph CorePlatform ["Core Identity & Tenant Engine"]
-        MA["Module A:\nAuthentication & Sessions"]
-        MB["Module B:\nMulti-Tenancy & Orgs"]
-        ML["Module L:\nOrg Settings"]
-    end
-
-    subgraph ProjectManagement ["Project & Task Execution"]
-        MC["Module C:\nProjects & Scoping"]
-        MD["Module D:\nTasks & Dependencies"]
-        ME["Module E:\nKanban Board Engine"]
-    end
-
-    subgraph CollaborationServices ["Collaboration & Awareness"]
-        MF["Module F:\nComments & Mentions"]
-        MG["Module G:\nNotifications"]
-        MJ["Module J:\nAudit Trail"]
-    end
-
-    subgraph DataServices ["Data, Files & Insights"]
-        MH["Module H:\nDashboard Analytics"]
-        MI["Module I:\nSearch & Filter"]
-        MK["Module K:\nAttachments"]
-    end
-
-    MA --> MB --> MC --> MD --> ME
-    MD --- MF
-    MD --- MK
-    MC --- MH
-    MB --- MJ
-    MD --- MG
-    MC --- MI
+    Req["Incoming API Request / WebSocket Event"] --> L1["Layer 1: Identity Authentication\n(Validate JWT Session & User Liveness)"]
+    L1 --> L2["Layer 2: Tenant Context Validation\n(Verify Active Membership in Target Organization)"]
+    L2 --> L3["Layer 3: Organization RBAC Policy\n(Verify ORG_OWNER, ORG_ADMIN, ORG_MEMBER, ORG_GUEST)"]
+    L3 --> L4["Layer 4: Project Access Policy\n(Verify Private Project Membership or Admin Override)"]
+    L4 --> L5["Layer 5: Scoped Database Query Execution\n(Mandatory WHERE organizationId AND projectId)"]
+    L5 --> L6["Layer 6: WebSocket & File Download Authorization\n(Room Subscriptions & Pre-Signed Storage Tokens)"]
 ```
 
-### Module A — Authentication and Account Management
-
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-001** | MUST | User Registration | Email, password, full name | Validates email syntax, enforces password complexity (min 8 chars, 1 uppercase, 1 number, 1 special char). Hashes password with Argon2id ($m=65536, t=3, p=4$). Creates user record with `isEmailVerified: false`. Queues verification email token. |
-| **FR-002** | MUST | Email Verification | Verification token from email link | Validates token signature and expiration (24h TTL). Sets `isEmailVerified: true`. Invalidates used token. |
-| **FR-003** | MUST | User Authentication (Login) | Email, password | Verifies user credentials via Argon2id. Generates a stateful `Session` record in database/Redis. Issues a short-lived access JWT (15m) and rotated refresh token (7d) in `HttpOnly`, `SameSite=Strict`, `Secure` cookies. Updates `lastLoginAt`. |
-| **FR-004** | MUST | User Logout | Logout request | Clears authentication cookies on client. Deletes the active `Session` record from database/Redis. Disconnects authenticated WebSocket connections associated with this session. |
-| **FR-005** | MUST | Token Rotation & Session Refresh | Valid refresh token cookie | Validates refresh token against active session. Issues new short-lived access token (15m) and rotated single-use refresh token. Replaces old token hash in database (reuse detection). |
-| **FR-006** | MUST | Password Reset Request | Account email address | Generates cryptographically secure, single-use reset token with 1-hour expiration. Dispatches reset email. Always returns 200 OK to prevent email enumeration. |
-| **FR-007** | MUST | Password Reset Execution | Valid reset token, new password | Validates token. Updates user password hash with Argon2id. Atomically invalidates all active sessions for the user across all devices. |
-| **FR-008** | MUST | In-App Password Change | Current password, new password | Authenticated user supplies current password. Verifies current password. Updates password hash with Argon2id. Invalidates all other active sessions except current. |
-| **FR-009** | MUST | User Profile Management | Name, bio, timezone, job title | Updates user profile metadata. Validates string lengths and character constraints. Returns updated profile DTO. |
-| **FR-010** | SHOULD | Profile Avatar Upload | Image file (JPEG/PNG/WebP, max 2MB) | Validates MIME type via binary magic bytes. Resizes/optimizes avatar. Streams to object storage under unique UUID key. Updates user avatar URL. Deletes old avatar file if present. |
-| **FR-011** | MUST | Active Session Inspection | Authenticated user request | Lists all active sessions for the user: device name, OS/browser, IP address, creation time, and last activity time. |
-| **FR-012** | MUST | Remote Session Revocation | Target `sessionId` or "Revoke all other" | Deletes specified session(s) from database/Redis. Subsequent API requests using revoked session tokens are rejected with 401 Unauthorized. |
-| **FR-013** | MUST | Two-Tier Rate Limiting Protocol | Login, register, and reset endpoints | **Tier 1 (IP Throttling):** Max 10 req/min per IP on public auth endpoints.<br>**Tier 2 (Account Lockout):** 5 consecutive failed login attempts on an email within 15 min triggers a 15-minute lockout. Returns 429 Too Many Requests. |
-
----
-
-### Module B — Organization and Multi-Tenancy
-
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-014** | MUST | Organization Creation | Org name, optional slug/logo | Creates new `Organization` entity. Creates `Membership` record associating authenticated user with role `ORG_OWNER`. Automatically sets active workspace context. |
-| **FR-015** | MUST | Organization Metadata Update | Org name, logo | Allowed only for `ORG_OWNER` and `ORG_ADMIN`. Updates organization record. Emits real-time update event to org members. |
-| **FR-016** | MUST | Workspace Context Switching | Target `organizationId` | Verifies user possesses an active membership in target organization. Sets active tenant context cookie. Subsequent requests are scoped strictly to this tenant. |
-| **FR-017** | MUST | Member Invitation | Invitee email, target role (`ORG_ADMIN`, `ORG_MEMBER`, `ORG_GUEST`) | Authorized user (`ORG_OWNER`/`ORG_ADMIN`) creates invitation. Generates cryptographically random token with 7-day expiration. Dispatches invitation email. Status set to `PENDING`. |
-| **FR-018** | MUST | Invitation Status Tracking | Invitation lifecycle | Tracks status transitions: $\text{PENDING} \longrightarrow \{\text{ACCEPTED} \mid \text{DECLINED} \mid \text{EXPIRED} \mid \text{REVOKED}\}$. Prevents acceptance of non-pending tokens. |
-| **FR-019** | MUST | Invitation Acceptance | Valid token, authenticated user | Verifies authenticated user's email matches the invitation email. Creates `Membership` record. Updates invitation status to `ACCEPTED`. |
-| **FR-020** | MUST | Invitation Decline & Revocation | Token or invitation ID | Invitee can decline (status set to `DECLINED`); Org Admin/Owner can cancel (status set to `REVOKED`). |
-| **FR-021** | MUST | Member Role Modification | `targetUserId`, new role | Only `ORG_OWNER` (or `ORG_ADMIN` modifying non-owners) can change member roles. Prevents demoting the organization's sole `ORG_OWNER`. |
-| **FR-022** | MUST | Member Removal | `targetUserId` | Removes user from `Membership`. Cascades removal from all `ProjectMember` records and unassigns from active tasks within the organization. Disconnects user's active WebSockets for this org. |
-| **FR-023** | MUST | Sole Owner Invariant Enforcement | Demote/remove owner request | The system strictly forbids deleting or demoting the last `ORG_OWNER` of an organization. Returns 400 Bad Request with explicit error code `LAST_OWNER_CANNOT_BE_REMOVED`. |
-| **FR-024** | MUST | Two-Layer Authorization Barrier | Every API request | **Layer 1 (Tenant Isolation):** Backend guard verifies entity `organizationId === activeOrganizationId`. Rejects cross-tenant access with 403 Forbidden.<br>**Layer 2 (Project Scoping):** For project-level entities, verifies caller is an assigned `ProjectMember` (or Org Owner/Admin). Rejects unauthorized internal access with 403 Forbidden. |
+### Layered Defense Enforcement Matrix
+1. **Layer 1 (Authentication):** Extracts and cryptographically verifies the short-lived access JWT from `HttpOnly` cookies. Validates that the backing `Session` record in database/Redis is active and has not been revoked.
+2. **Layer 2 (Tenant Context Validation):** Resolves the target `organizationId` from the verified URL path or request context. Validates that the authenticated user holds an active, non-suspended `Membership` record for that specific organization.
+3. **Layer 3 (Organization RBAC):** Evaluates organizational permissions (e.g. inviting members, modifying org settings, creating projects).
+4. **Layer 4 (Project Scoping):** Because projects are private by default (Decision Q2), access to any project-scoped resource (tasks, boards, comments) requires verifying that the user is an explicit `ProjectMember` with an assigned role (`PROJECT_MANAGER`, `CONTRIBUTOR`, `VIEWER`), unless the user holds `ORG_OWNER` or `ORG_ADMIN` override privileges.
+5. **Layer 5 (Database Scoping):** All data-access services and repositories enforce explicit tenant and project filters:
+   ```typescript
+   // Mandatory pattern across all queries
+   where: {
+     id: resourceId,
+     projectId: validatedProjectId,
+     organizationId: validatedActiveOrgId,
+     deletedAt: null,
+   }
+   ```
+   *Nested Prisma Operations & Raw SQL:* Nested writes (`create`, `update`, `connect`) must explicitly include foreign key checks. Raw SQL (`$queryRaw`) is prohibited unless parameterized with explicit tenant predicates.
+   *Background Jobs & Scheduled Tasks:* Workers must run within an explicitly injected tenant security context; jobs cannot execute across tenants without partitioned batches.
+6. **Layer 6 (WebSockets & File Downloads):** WebSocket connection handshakes verify authentication tokens; joining rooms (`org:<id>`, `project:<id>`) executes the identical Layer 2 and Layer 4 checks. File downloads require a signed token generated only after validating project membership.
+7. **PostgreSQL Row-Level Security (RLS) Evaluation:** While PostgreSQL native RLS provides database-level enforcement (`USING (organization_id = current_setting('app.current_org_id'))`), it requires executing `SET LOCAL app.current_org_id` on every acquired database connection. Because Prisma uses a connection pool (and frequently runs behind PgBouncer in production where session-level settings can bleed across pooled connections unless wrapped in dedicated transactions), RLS is evaluated as an optional supplementary defense, not a replacement for programmatic Layer 5 scoping.
 
 ---
 
-### Module C — Project Management
+## 3. String-Based Fractional Indexing & Kanban Concurrency (Decision Q3)
 
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-025** | MUST | Project Creation & Auto-PM Assignment | Title, description, dates, status | Allowed for `ORG_OWNER`, `ORG_ADMIN`, and authorized `ORG_MEMBER`. Creates `Project` belonging to active `organizationId`. Atomically adds creator as `ProjectMember` with role `PROJECT_MANAGER`. |
-| **FR-026** | MUST | Project Detail Retrieval | `projectId` | Validates user membership in project (or Org Owner/Admin privileges). Returns project details, task summary statistics, and assigned members. |
-| **FR-027** | MUST | Project Metadata Update | Title, description, start/end dates | Authorized user (`ORG_OWNER`, `ORG_ADMIN`, or project `PROJECT_MANAGER`) updates project fields. Emits `project.updated` real-time event. |
-| **FR-028** | MUST | Project Status Transition | New status | Validates transition across states: `PLANNING`, `ACTIVE`, `ON_HOLD`, `COMPLETED`, `ARCHIVED`. Logs transition to activity audit trail. |
-| **FR-029** | MUST | Project Archival | `projectId`, archive action | Sets status to `ARCHIVED`. Hides project from active project queries by default. All tasks within archived projects become read-only. |
-| **FR-030** | MUST | Project Soft Deletion | `projectId`, delete action | Restricted to `ORG_OWNER` and `ORG_ADMIN`. Sets `deletedAt` timestamp. Preserves data for 30-day recovery. Cascades soft delete to associated tasks and comments. |
-| **FR-031** | MUST | Project Member Assignment | `projectId`, `userId`, project role | Adds organization member to `ProjectMember` with role `CONTRIBUTOR` or `VIEWER`. Dispatches notification to assigned member. |
-| **FR-032** | MUST | Project Member Removal | `projectId`, `userId` | Removes `ProjectMember` record. Unassigns user from any pending tasks in the project. Revokes project WebSocket channel access. |
-| **FR-033** | MUST | Project Manager Designation | `projectId`, `userId` | Assigns designated project member as `PROJECT_MANAGER` for the project. |
-| **FR-034** | MUST | Project Listing & Filtering | Query parameters: status, search | Returns paginated list of projects accessible to the user within the active organization. Enforces project visibility scoping. |
+### 3.1 Ordering Key Specification
+Floating-point indices (`orderIndex: Float`) are discarded due to IEEE 754 precision exhaustion. TeamFlow implements **string-based fractional indexing** (utilizing the byte-lexicographical principles established by David Greenspan and utilized in Linear/Figma):
 
----
+- **Key Representation:** Variable-length ASCII strings using base-62 characters (`0-9`, `A-Z`, `a-z`) or base-95 printable characters.
+- **Midpoint Generation:** Given two adjacent cards with keys $K_1$ and $K_2$ where $K_1 < K_2$, the algorithm generates a lexicographically intermediate key $K_{\text{new}}$ such that $K_1 < K_{\text{new}} < K_2$.
+  - Example: Between `"a0"` and `"a1"`, the generator produces `"a0V"`.
+  - When inserting at the top: Given first card `"a0"`, generates `"Zz"`.
+  - When inserting at the bottom: Given last card `"z9"`, generates `"za"`.
+- **Arbitrary Precision:** Because string keys grow in length as intervals narrow, precision is theoretically unbounded and immune to numeric floating-point mantissa underflow.
 
-### Module D — Task Management
+```mermaid
+sequenceDiagram
+    autonumber
+    actor DevA as Developer A
+    actor DevB as Developer B
+    participant API as Tasks Controller
+    participant DB as PostgreSQL Transaction
 
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-035** | MUST | Task Creation | Title, description, `projectId`, priority, due date, status | Validates title (1–255 chars), due date, and user project access. Sets status (defaults to `TODO` or `BACKLOG`). Assigns fractional `orderIndex` for Kanban position. |
-| **FR-036** | MUST | Task Detail Retrieval | `taskId` | Returns task record, assignees, labels, subtasks, attachments, comments count, dynamic `isBlocked` flag, and status change history. Enforces Layer 2 project access check. |
-| **FR-037** | MUST | Task Update | Title, description, priority, due date | Updates task attributes. Verifies user has edit permissions in project. Records activity log. Emits `task.updated` event. |
-| **FR-038** | MUST | Task Status Transition | `newStatus` | Validates status against enum: `BACKLOG`, `TODO`, `IN_PROGRESS`, `IN_REVIEW`, `DONE`, `CANCELLED`. Updates task status and `updatedAt`. Emits `task.status_changed`. |
-| **FR-039** | MUST | Task Status History Logging | On status change | Automatically inserts `TaskStatusHistory` record capturing `taskId`, `oldStatus`, `newStatus`, `changedById`, and timestamp. |
-| **FR-040** | MUST | Task Assignee Management | `taskId`, array of `userId`s | Assigns or unassigns members. Emits `task.assigned` event. Generates in-app notifications for newly assigned users. |
-| **FR-041** | MUST | Task Assignee Validation | Assignee `userId` | Strictly rejects assigning any user who is not an explicit member of the task's parent project. Returns 400 Bad Request with `ASSIGNEE_NOT_IN_PROJECT`. |
-| **FR-042** | MUST | Task Priority Assignment | Priority level | Validates priority: `LOW`, `MEDIUM`, `HIGH`, `URGENT`. Updates task record and emits real-time update. |
-| **FR-043** | MUST | Subtask / Checklist Management | Title, completed boolean | Allows creating, toggling completion, and deleting single-level checklist items within a task. Computes checklist completion ratio (e.g., 3/5 complete). |
-| **FR-044** | SHOULD | Task Dependency Linking | `taskId`, `dependsOnTaskId` | Creates dependency where Task A is blocked by Task B. Enforces that both tasks belong to the same project. Sets dynamic `isBlocked = true` on Task A if Task B is not `DONE`. |
-| **FR-045** | MUST | Circular Dependency Prevention | New dependency link | Executes cycle detection algorithm (Depth-First Search / topological check). Strictly rejects links that introduce cycles ($A \rightarrow B \rightarrow A$). Returns 400 `CIRCULAR_DEPENDENCY_DETECTED`. |
-| **FR-046** | MUST | Task Soft Deletion | `taskId` | Sets `deletedAt` timestamp. Hides task from active board and list views while preserving comments and audit trail. |
+    Note over DevA,DevB: Both users view Task #104 in TODO (version: 3, orderKey: "a5")
+    DevA->>API: Move Task #104 to IN_PROGRESS between "a1" and "a2" (version: 3)
+    API->>API: Generate intermediate key: "a1V"
+    API->>DB: BEGIN Transaction
+    API->>DB: UPDATE Task SET status='IN_PROGRESS', orderKey='a1V', version=4 WHERE id=104 AND version=3
+    API->>DB: INSERT TaskStatusHistory, INSERT ActivityLog
+    API->>DB: COMMIT Transaction (Success)
+    API-->>DevA: 200 OK (Task moved to "a1V")
 
----
+    DevB->>API: Move Task #104 to DONE between "b0" and "b1" (version: 3)
+    API->>API: Generate intermediate key: "b0V"
+    API->>DB: BEGIN Transaction
+    API->>DB: UPDATE Task SET status='DONE', orderKey='b0V', version=4 WHERE id=104 AND version=3
+    Note over DB: No rows updated! (Current version in DB is 4, not 3)
+    API->>DB: ROLLBACK Transaction
+    API-->>DevB: 409 Conflict { errorCode: "CONCURRENT_MODIFICATION" }
+    Note over DevB: Client reverts card UI & displays toast: "Card was moved by another user"
+```
 
-### Module E — Kanban Board
-
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-047** | MUST | Kanban Board Aggregation | `projectId` | Returns tasks grouped into status columns (`BACKLOG`, `TODO`, `IN_PROGRESS`, `IN_REVIEW`, `DONE`, `CANCELLED`), ordered ascending by `orderIndex`. Each task includes its computed `isBlocked` flag. |
-| **FR-048** | MUST | Cross-Column Drag-and-Drop | `taskId`, `newStatus`, `prevTaskId`, `nextTaskId` | Updates task status to target column. Calculates new `orderIndex = (prev.orderIndex + next.orderIndex) / 2`. Records status history. Emits `task.status_changed`. |
-| **FR-049** | MUST | Intra-Column Reordering | `taskId`, `prevTaskId`, `nextTaskId` in same column | Recalculates `orderIndex` to position card between target neighbors. Updates database. Emits `task.reordered`. |
-| **FR-050A** | MUST | Fractional Card Indexing | Card reordering action | Assigns floating-point order index enabling $O(1)$ reordering without updating surrounding cards. |
-| **FR-050B** | MUST | Automatic Column Rebalancing | Card drop where $|prev - next| < 10^{-6}$ | When floating point precision gap drops below threshold, backend atomically rebalances the column, spacing all cards by integer increments of $1000$. |
-| **FR-051** | MUST | Optimistic UI Updates | Client drag event | Client UI updates board immediately without waiting for server network roundtrip. |
-| **FR-052** | MUST | Concurrency & Rejection Rollback | Server rejection / error | If server rejects move (403, 404, or optimistic locking 409 conflict), client reverts card to previous column and position and displays error toast. |
-| **FR-053** | MUST | Board Filtering | Assignee, priority, label query | Filters displayed board cards in real time. Persists active filter selections in URL query parameters. |
-
----
-
-### Module F — Comments and Collaboration
-
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-054** | MUST | Task Comment Creation | `taskId`, markdown content | Sanitizes input using DOMPurify to prevent XSS. Saves comment record linked to task and author. Broadcasts `comment.created` to task room. |
-| **FR-055** | MUST | Comment Editing | `commentId`, updated content | Only original author can edit comment. Updates content and sets `isEdited: true` with `updatedAt`. Emits `comment.updated`. |
-| **FR-056** | MUST | Comment Deletion | `commentId` | Author, Project Manager, or Org Admin can delete comment. Soft deletes comment. Emits `comment.deleted`. |
-| **FR-057** | MUST | User Mentions (@username) | Comment text containing `@username` | Regex parses mentions. Verifies mentioned users belong to the project. Creates notifications for mentioned users. |
-| **FR-058** | MUST | Live Comment Broadcasting | New comment created | Dispatches real-time WebSocket event to all clients actively viewing the task or project room. |
+### 3.2 Concurrency, Duplicate Keys & Tie-Breaking
+1. **Fractional Indexing Does Not Eliminate Concurrency Conflicts:** Fractional indexing solves the mathematical key generation problem, but concurrent moves of the same card or multiple cards dropped into the same slot still require concurrency control.
+2. **Optimistic Concurrency Control:** Every `Task` record contains an integer `version` field. Status and order updates execute with a conditional write:
+   $$\text{UPDATE tasks SET status = :status, orderKey = :key, version = version + 1 WHERE id = :id AND version = :expectedVersion}$$
+   If 0 rows are updated, the transaction rolls back, and the API returns HTTP 409 Conflict.
+3. **Simultaneous Drops Between the Same Neighbors:** If two different tasks (Task X and Task Y) are dropped between the same neighbors concurrently, both may receive the identical generated key (e.g. `"a1V"`).
+   - **Deterministic Tie-Breaking:** In all queries, sorting is defined as:
+     $$\text{ORDER BY orderKey ASC, id ASC}$$
+     If keys match, the immutable `UUID` ensures deterministic card ordering across all clients without visual jumping.
+4. **Column Rebalancing (Key Regeneration):** Over thousands of moves, string keys can grow in length (e.g. exceeding 32 characters).
+   - **Trigger:** A background rebalancing routine is triggered when any key length exceeds 64 characters.
+   - **Execution:** A single atomic transaction re-spaces all tasks in that specific project column with clean, uniform 2-character keys: `"a0"`, `"a1"`, `"a2"`, ..., `"z9"`.
+   - **Safety:** The rebalance transaction acquires a row-level lock on the project column (`FOR UPDATE`), preventing concurrent card drops during the milliseconds of re-indexing.
+5. **Atomic Transaction Boundary:** Moving a task across columns executes the following operations in a **single ACID transaction**:
+   - `UPDATE Task` (new status, new `orderKey`, increment `version`, update `updatedAt`).
+   - `INSERT TaskStatusHistory` (captures `taskId`, `oldStatus`, `newStatus`, `changedById`, timestamp).
+   - `INSERT ActivityLog` (captures `organizationId`, actor, action `'TASK_STATUS_CHANGED'`, metadata).
 
 ---
 
-### Module G — Notifications
+## 4. Authentication, Session Management & Anti-Lockout Rate Limiting
 
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-059** | MUST | Notification Generation | Assignment, mention, comment, invite | Automatically generates `Notification` record in database with actor, recipient, type, target entity link, and read status `false`. |
-| **FR-060** | MUST | Real-Time Push Delivery | New notification generated | Emits `notification.created` over WebSocket to the specific user's private socket room (`user:<userId>`). |
-| **FR-061** | MUST | Notification Persistence & Retention | System events | Persists all notifications in PostgreSQL so users receive full historical unread alerts upon logging in or reconnecting. Retained for 90 days. |
-| **FR-062** | MUST | Notification Listing & Pagination | Authenticated user request | Returns paginated list of notifications for the user within the active organization, ordered newest first. |
-| **FR-063** | MUST | Mark Notification Read / Unread | `notificationId`, `isRead` boolean | Updates read state for specified notification. Decrements unread badge count. |
-| **FR-064** | MUST | Mark All Notifications Read | Mark all action | Bulk updates all unread notifications for the user in the active organization to `isRead: true`. |
-| **FR-065** | SHOULD | Notification Preferences | Preference toggles per event type | Allows user to toggle in-app and email notification preferences for assignments, comments, and mentions. |
+### 4.1 Anti-Lockout Rate-Limiting Policy (Resolving Denial-of-Service Risk)
+Account lockout policies that lock an account after 5 failed password attempts create a critical Denial-of-Service (DoS) vulnerability: an attacker can intentionally lock out company executives simply by submitting 5 wrong passwords for their email addresses.
 
----
+TeamFlow resolves this with a **Resilient Multi-Tier Rate-Limiting Policy**:
 
-### Module H — Dashboard and Analytics
+```mermaid
+flowchart TD
+    Req["Incoming Login Request"] --> T1["Tier 1: IP-Based Throttling\n(Redis Sliding Window: Max 10 req/min per IP)"]
+    T1 -- Exceeded --> R1["HTTP 429 Too Many Requests\n(Blocks network floods, does not lock account)"]
+    T1 -- Allowed --> Auth["Validate Email & Argon2id Hash"]
+    Auth -- Success --> Reset["Reset Failed Counter in Redis\nIssue Session Cookies (200 OK)"]
+    Auth -- Failure --> T2["Tier 2: Progressive Account Delay\n(Track Consecutive Failures for Email)"]
+    T2 --> C1{"Consecutive Failures?"}
+    C1 -- 1 to 3 --> D1["Return 401 Unauthorized (Generic Error)"]
+    C1 -- 4 to 9 --> D2["Enforce Progressive Artificial Delay (1s - 5s)\nReturn 401 Unauthorized"]
+    C1 -- 10+ Failures --> D3["Trigger 15-Minute IP-Email Cooldown\nRequire Captcha / Email Link to Unlock\nAccount remains accessible from existing active sessions"]
+```
 
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-066** | MUST | Organization Dashboard Metrics | `organizationId` | Calculates: Total Projects, Active Projects, Completed Projects, Total Tasks, Pending Tasks, Overdue Tasks, Task Completion Rate (%), and Recent Activity.<br>$$\text{Completion Rate} = \left(\frac{\text{Count}(\text{Tasks } status = \text{DONE})}{\text{Count}(\text{Tasks } status \neq \text{CANCELLED})}\right) \times 100$$<br>$$\text{Overdue} = \text{Tasks where } dueDate < \text{NOW}() \text{ AND } status \notin (\text{'DONE'}, \text{'CANCELLED'})$$ |
-| **FR-067** | MUST | Project Dashboard Metrics | `projectId` | Calculates: Project Progress %, Task Distribution by Status, Tasks by Priority breakdown, Overdue Tasks list, and Member Workload distribution. Progress formula identical to completion rate scoped to project. |
-| **FR-068** | MUST | Redis Metric Caching | Dashboard query | Caches computed analytics aggregates in Redis with 60-second TTL. Automatically invalidates cache keys upon task or project mutations. |
-
----
-
-### Module I — Search and Filtering
-
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-069** | MUST | Global Workspace Search | Search query string (min 2 chars) | Searches across accessible projects, tasks, and members within active organization. Enforces Layer 2 project scoping on task results. |
-| **FR-070** | MUST | Multi-Attribute Task Filtering | Filters: status, priority, assignee, due date, label | Dynamically builds parameterized database query applying all selected filters. Returns filtered task list. |
-| **FR-071** | MUST | Pagination and Sorting | `page`, `limit` (max 100), `sortBy`, `sortOrder` | Implements limit-offset or cursor pagination on all list endpoints. Enforces default limit of 20 and maximum cap of 100. |
-
----
-
-### Module J — Activity Logs and Audit Trail
-
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-072** | MUST | Audit Event Recording | System actions (project created, member invited, status changed, settings modified) | Creates immutable `ActivityLog` capturing `organizationId`, `actorId`, `actionType`, `entityType`, `entityId`, `metadata` (JSON), and timestamp. |
-| **FR-073** | MUST | Activity Feed Retrieval | `organizationId` or `projectId` | Returns paginated activity feed filtered by user's authorized scope. |
-| **FR-074** | MUST | Audit Log Immutability | Update or delete attempts | Activity logs are strictly append-only. API endpoints do NOT expose update or delete methods. Service guards reject alterations. |
+1. **Tier 1 (IP-Based Request Throttling):** Enforces a Redis sliding window limit of **10 requests per minute per IP address** across all public `/auth/*` endpoints. If exceeded, returns HTTP 429 Too Many Requests. This halts volumetric network flooding without penalizing specific accounts.
+2. **Tier 2 (Progressive Account Cooldown, Not Hard Lockout):**
+   - Failures 1–3: Standard generic error response: `"Invalid email or password"`.
+   - Failures 4–9: The backend injects a progressive server-side artificial delay (1 second to 5 seconds) before returning HTTP 401. This completely ruins the throughput of automated brute-force scripts while allowing humans to retry.
+   - Failures 10+: The specific `(IP + email)` pairing is placed on a 15-minute cooldown. The account is **never globally locked**: existing active sessions for that user continue functioning uninterrupted.
+3. **Generic Error Responses:** All authentication failures return identical timing and message payloads (`"Invalid email or password"`) to eliminate account enumeration.
+4. **Endpoint-Specific Throttling:**
+   - `/auth/forgot-password`: Max 3 requests per hour per email address. The API **always returns HTTP 200 OK** regardless of whether the email exists, preventing enumeration.
+   - `/auth/verify-email`: Max 5 verification attempts per hour per token.
+5. **Distributed Storage:** All rate-limiting buckets and counters reside in **Redis**, ensuring consistent enforcement across multiple NestJS application instances.
 
 ---
 
-### Module K — File and Attachment Management
+## 5. File Upload & Storage Security Architecture (Decision D)
 
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-075** | MUST | Secure File Upload Pipeline | Multipart upload: file, `taskId` | Validates file size (max 10MB) and MIME type. Inspects binary magic bytes in-memory before streaming to S3/MinIO bucket under unique UUID key. |
-| **FR-076** | MUST | Attachment Metadata Storage | Post-upload | Saves `Attachment` record in PostgreSQL containing original filename, storage key, MIME type, size in bytes, uploader ID, and `taskId`. |
-| **FR-077** | MUST | Secure File Download / View | `attachmentId` | Verifies user's access rights to the associated project. Generates pre-signed S3/MinIO URL with 15-minute expiration. Client downloads directly from storage. |
-| **FR-078** | MUST | Attachment Deletion & Orphan Cleanup | Delete attachment action | Author or Org Admin can delete attachment. Deletes database record and issues delete command to object storage. Daily background worker prunes orphaned storage blobs. |
+File uploads for Version 1.0 (MVP) are processed via an in-memory streaming pipeline through the NestJS backend with strict validation before transmission to MinIO/S3:
 
----
+```mermaid
+flowchart LR
+    Client["Client Upload\n(Multipart Form <= 10MB)"] --> Nest["NestJS API (Multer Stream)\nIn-Memory Buffer"]
+    Nest --> V1["Validation 1: File Size <= 10MB"]
+    V1 --> V2["Validation 2: Allowlist & Magic Bytes Check"]
+    V2 --> V3["Validation 3: Path Traversal Strip"]
+    V3 --> S3["Object Storage (MinIO / S3)\nUnique UUID Key"]
+    S3 --> DB["PostgreSQL Metadata Record\n(Attachment Entity)"]
+    ClientDownload["Download Request"] --> Guard["Layer 4 Project Access Guard"]
+    Guard --> PreSigned["Generate Pre-Signed S3 URL\n(15-min TTL, Content-Disposition: attachment)"]
+```
 
-### Module L — Organization Settings
-
-| ID | Priority | Requirement Description | Inputs / Triggers | Expected System Behavior & Validation |
-|---|---|---|---|---|
-| **FR-079** | MUST | Organization Profile Settings | Org name, avatar/logo | Restricted to `ORG_OWNER` and `ORG_ADMIN`. Updates organization profile. Emits real-time update. |
-| **FR-080** | MUST | Organization Member Directory | Org view | Displays all active members, their roles, join dates, and invitation statuses. Allows `ORG_OWNER`/`ORG_ADMIN` to manage members. |
-| **FR-081** | MUST | Organization Deletion (Danger Zone) | `organizationId`, confirmation string | Restricted strictly to `ORG_OWNER`. Requires typing full organization name to confirm. Soft-deletes organization and cascades soft-delete to child projects and tasks. |
-
----
-
-## 3. Two-Tier Role-Based Access Control (RBAC) Matrix
-
-TeamFlow divides authorization into two explicit scopes:
-1. **Tier 1 (Organization-Level Roles):** `ORG_OWNER`, `ORG_ADMIN`, `ORG_MEMBER`, `ORG_GUEST`
-2. **Tier 2 (Project-Level Roles):** `PROJECT_MANAGER`, `CONTRIBUTOR`, `VIEWER`
-
-### 3.1 Organization-Level Permissions Matrix
-
-| Capability / Action | Platform Admin | ORG_OWNER | ORG_ADMIN | ORG_MEMBER | ORG_GUEST |
-|---|:---:|:---:|:---:|:---:|:---:|
-| Access Global System Metrics | ✅ | ❌ | ❌ | ❌ | ❌ |
-| Delete Organization (Danger Zone) | ✅ | ✅ | ❌ | ❌ | ❌ |
-| Transfer Organization Ownership | ❌ | ✅ | ❌ | ❌ | ❌ |
-| Update Organization Name / Logo | ✅ | ✅ | ✅ | ❌ | ❌ |
-| View Organization Audit Activity Logs | ✅ | ✅ | ✅ | ❌ | ❌ |
-| Invite New Members to Organization | ❌ | ✅ | ✅ | ❌ | ❌ |
-| Remove Member from Organization | ❌ | ✅ | ✅ | ❌ | ❌ |
-| Modify Member Role (Promote/Demote) | ❌ | ✅ | ✅ (non-owners) | ❌ | ❌ |
-| View Organization Member Directory | ✅ | ✅ | ✅ | ✅ | ✅ |
-| Create New Project in Organization | ❌ | ✅ | ✅ | ✅ (auto-assigned PM) | ❌ |
+### Mandatory Storage Security Safeguards
+1. **Explicit MIME & Extension Allowlist:** Only the following file types are permitted:
+   - Images: `image/jpeg` (`.jpg`, `.jpeg`), `image/png` (`.png`), `image/webp` (`.webp`).
+   - Documents: `application/pdf` (`.pdf`), `text/plain` (`.txt`).
+   - Archives: `application/zip` (`.zip`).
+   All other formats (including `.exe`, `.sh`, `.html`, `.svg`, `.php`) are strictly rejected.
+2. **Binary Magic-Byte Inspection:** The server inspects the first 512 bytes of the file stream using `file-type` to detect the true binary signature. If the detected magic bytes do not match the declared client `Content-Type`, the upload is rejected immediately with HTTP 400 (`FILE_TYPE_MISMATCH`).
+3. **Path Traversal Defense & Randomized Keys:** Client-provided filenames are completely discarded for storage keys. Files are stored under cryptographically randomized paths:
+   $$\text{storageKey} = \text{"attachments/"} + \text{organizationId} + \text{"/"} + \text{UUIDv4}() + \text{"."} + \text{sanitizedExtension}$$
+4. **Storage Isolation:** Files are stored strictly in private object storage buckets (MinIO locally, S3 in production). Files are never written to the public web server root or static asset directories.
+5. **Secure Download Pipeline:** Direct access to storage buckets is forbidden. Downloads require calling `GET /api/v1/attachments/:id/download`:
+   - The backend executes Layer 2 (Tenant) and Layer 4 (Project) checks.
+   - Generates a pre-signed S3 URL with **15-minute expiration**.
+   - Enforces safe download headers:
+     `Content-Disposition: attachment; filename="sanitized-original-name.ext"`  
+     `X-Content-Type-Options: nosniff`
+6. **Failed Uploads & Orphan Cleanup:** Direct uploads execute atomically with database record creation. A daily scheduled cron worker queries S3 for objects created $>24\text{ hours}$ ago with no corresponding `Attachment` record in PostgreSQL, permanently pruning orphaned storage blobs.
+7. **Concurrency & Memory Limits:** Multer is configured with `limits: { fileSize: 10 * 1024 * 1024, files: 1 }`. Max 3 simultaneous uploads per authenticated user session.
+8. **Malware Scanning (Future Enhancement):** ClamAV antivirus container integration is formally cataloged as a Version 2.0 security enhancement.
 
 ---
 
-### 3.2 Project-Level Permissions Matrix
+## 6. Real-Time Event Reliability & Delivery Model (Decision E)
 
-> *Note:* `ORG_OWNER` and `ORG_ADMIN` possess superuser override access across all projects within their organization. For `ORG_MEMBER` and `ORG_GUEST` users, project permissions are strictly determined by their assigned `ProjectMember` role:
+### 6.1 Database Commit vs. Event Publish vs. Client Delivery
+In collaborative software, event reliability requires distinguishing three distinct operational phases:
 
-| Capability / Action | PROJECT_MANAGER | CONTRIBUTOR | VIEWER (Guest default) |
-|---|:---:|:---:|:---:|
-| Update Project Metadata (Title, Dates) | ✅ | ❌ | ❌ |
-| Add / Remove Members from Project | ✅ | ❌ | ❌ |
-| Archive / Soft-Delete Project | ✅ (Owner/Admin only) | ❌ | ❌ |
-| Create Task in Project | ✅ | ✅ | ❌ |
-| Move / Reorder Task on Kanban Board | ✅ | ✅ | ❌ |
-| Update Task Details (Title, Description) | ✅ | ✅ (assigned/creator) | ❌ |
-| Change Task Status (e.g. TODO $\rightarrow$ DONE) | ✅ | ✅ | ❌ |
-| Assign / Unassign Members to Task | ✅ | ✅ | ❌ |
-| Soft-Delete Task | ✅ | ❌ | ❌ |
-| Post Comment on Task | ✅ | ✅ | ✅ (assigned tasks) |
-| Upload File Attachment to Task | ✅ | ✅ | ❌ |
-| Download Task Attachment | ✅ | ✅ | ✅ |
-
----
-
-## 4. Reconciled Non-Functional Requirements (NFR-001 to NFR-020)
-
-| ID | Category | Requirement Specification | Metric & Verification Method |
+| Phase | Responsibility | Failure Mode | System Behavior |
 |---|---|---|---|
-| **NFR-001** | Security | **Two-Layer Authorization Enforcement:** 100% rejection of cross-tenant and unauthorized cross-project data access. | Every query filtered by `organizationId` and project membership. Verified by automated penetration tests (`test/e2e/tenant-isolation.e2e-spec.ts`). Must return 403 Forbidden. |
-| **NFR-002** | Security | **Password & Token Cryptography:** Passwords hashed with Argon2id ($m=65536, t=3, p=4$). Short-lived access JWTs (15m) and rotated refresh tokens (7d) stored in `HttpOnly`, `SameSite=Strict`, `Secure` cookies. | Verified via static analysis and token inspection tests. Tokens never stored in `localStorage` or URL parameters. |
-| **NFR-003** | Security | **Backend RBAC Guards:** All endpoints protected by NestJS Guards (`JwtAuthGuard`, `TenantGuard`, `RolesGuard`). | Zero routes accessible without appropriate guards. |
-| **NFR-004** | Security | **Strict Input Validation:** Class-validator DTOs with `whitelist: true, forbidNonWhitelisted: true`. DOMPurify HTML sanitization. | Extra payload fields rejected with 400 Bad Request. |
-| **NFR-005** | Security | **Two-Tier Rate Limiting Protocol:** IP throttling and account lockout. | Max 10 req/min per IP on public auth; 5 failed logins on an email within 15 min triggers 15 min lockout. Authenticated API capped at 100 req/min per session. |
-| **NFR-006** | Security | **File Upload Hardening:** 10MB file limit; in-memory magic byte inspection; randomized UUID storage keys; pre-signed download URLs (15m TTL). | Upload of disguised executable files rejected with 400 Bad Request. |
-| **NFR-007** | Performance | **Read API Latency:** Task lists, project overviews, and member directories. | **p95 latency < 200 ms** under 100 concurrent virtual users in local Docker environment. Verified via k6. |
-| **NFR-008** | Performance | **Write API Latency:** Task creation, drag-and-drop status changes, comments. | **p95 latency < 400 ms** under 50 concurrent write mutations. Verified via k6. |
-| **NFR-009** | Performance | **Real-Time Event Latency:** Database commit to client WebSocket receipt. | **< 100 ms** latency on local Docker environment. |
-| **NFR-010** | Performance | **Database Query Optimization:** Composite indexes on `(projectId, status, orderIndex)`, `(organizationId, projectId)`. | Zero queries exceeding 50 ms execution time on a 50,000 task dataset. No N+1 queries. |
-| **NFR-011** | Performance | **Enforced Pagination:** All list endpoints paginated. | Default: 20 items. Maximum cap: 100 items. Requests omitting pagination receive default limit. |
-| **NFR-012** | Reliability | **ACID Transactions:** Multi-record mutations executed via Prisma `$transaction`. | Zero partial writes during simulated mid-operation failures. |
-| **NFR-013** | Reliability | **Referential Integrity & Cascades:** Explicit foreign keys with soft-delete retention. | Deleting an organization cascades soft-delete to projects and tasks. |
-| **NFR-014** | Reliability | **Health Probes:** Terminus health endpoint `/api/v1/health` monitoring PostgreSQL, Redis, and storage. | Returns 200 OK or 503 Service Unavailable. |
-| **NFR-015** | Reliability | **WebSocket Reconnection & Board Resync:** Auto-reconnect with exponential backoff. | On reconnect, client fetches `GET /api/v1/projects/:id/board?since=<timestamp>` to reconcile missed updates. |
-| **NFR-016** | Maintainability | **Strict TypeScript:** `strict: true`, `noImplicitAny: true`. | Zero `any` shortcuts in application code. Passes `tsc --noEmit`. |
-| **NFR-017** | Maintainability | **Modular Monolith Encapsulation:** Zero cross-module direct repository access. | Verified via automated `dependency-cruiser` linting rules. |
-| **NFR-018** | Maintainability | **Automated Test Coverage:** Core business domains. | **>= 80% branch coverage** on authentication, tenant isolation, permissions, and task status logic. |
-| **NFR-019** | Usability | **Responsive Design:** Mobile (320px+), Tablet, Desktop. | Desktop-first optimization with touch targets >= 44x44px on mobile. |
-| **NFR-020** | Accessibility | **WCAG 2.1 AA:** Contrast >= 4.5:1, keyboard navigation. | Full keyboard support (Tab, Enter, Space, Escape, Arrow keys) for Kanban cards and modals. |
+| **Phase 1: Database Commit** | PostgreSQL (ACID Transaction) | Disk full, constraint failure, concurrency conflict | Transaction rolls back; API returns error; zero events are published. |
+| **Phase 2: Event Publish** | NestJS Service $\rightarrow$ Redis Pub/Sub | Redis broker network partition / crash | Database remains committed; warning logged; event emission fails. |
+| **Phase 3: Client Delivery** | Socket.IO Gateway $\rightarrow$ Connected Browsers | Client WiFi drops, mobile backgrounding | Event delivered to online clients; disconnected client misses event. |
+
+```mermaid
+sequenceDiagram
+    autonumber
+    participant API as NestJS API
+    participant DB as PostgreSQL
+    participant Redis as Redis Pub/Sub
+    participant Gateway as Socket.IO Gateway
+    participant Client as Reconnecting Client
+
+    API->>DB: Phase 1: COMMIT Transaction (Task status changed, updatedAt: T1)
+    DB-->>API: Commit Success
+    API->>Redis: Phase 2: PUBLISH to "project:10" (best-effort)
+    Redis->>Gateway: Relay to active sockets
+    Gateway-->>Client: Phase 3: Deliver (Client offline -> missed!)
+    
+    Note over Client: Client reconnects at T2
+    Client->>Gateway: Reconnect Handshake (JWT Auth)
+    Gateway->>Gateway: Validate Layer 2 & Layer 4 Room Permissions
+    Client->>API: GET /api/v1/projects/10/board?since=T0
+    API->>DB: Query tasks where projectId=10 AND updatedAt > T0
+    DB-->>API: Return modified tasks
+    API-->>Client: 200 OK (Reconcile missed board changes)
+```
+
+### 6.2 MVP Event Strategy vs. Transactional Outbox Pattern
+- **MVP (Version 1.0) Reliability Strategy:** Post-commit best-effort event publishing via Redis Pub/Sub combined with **Client-Side Reconnect Reconciliation**:
+  - The API emits WebSocket events only *after* the PostgreSQL transaction commits successfully (`$transaction().then(() => emit())`).
+  - To handle missed events during disconnections, when a Socket.IO client reconnects or regains browser focus, it triggers a lightweight reconciliation query:
+    $$\text{GET /api/v1/projects/:id/board?since=<lastKnownTimestamp>}$$
+  - Stale DOM nodes are refreshed to match authoritative server truth.
+- **Transactional Outbox Pattern (Cataloged for Version 1.2):** For guaranteed at-least-once event delivery, an `OutboxEvent` table will be introduced to PostgreSQL. Events are written inside the business transaction, and an asynchronous de-queuer reads the outbox table and publishes to Redis. This is formally cataloged for release v1.2 to avoid premature queue infrastructure in the MVP.
+
+### 6.3 WebSocket Connection & Room Security
+1. **Authentication Handshake:** Socket.IO connections must pass a valid JWT in the connection `auth.token` or cookie. Unauthenticated connections are rejected immediately (`disconnect(true)`).
+2. **Room Authorization:** Joining an organization room (`org:<id>`) or project room (`project:<id>`) requires the gateway to execute Layer 2 and Layer 4 checks.
+3. **Mid-Session Revocation:** If an administrator revokes a user's membership or removes them from a project, the backend service emits an internal revocation signal. The WebSocket gateway immediately removes the user's sockets from all associated project rooms and issues `socket.disconnect(true)`.
+4. **Idempotency & Duplicate Handling:** Every WebSocket event payload carries an immutable `eventId: UUID`. Clients maintain a sliding window of the last 100 received event IDs to discard duplicate messages.
 
 ---
 
-## 5. Updated Open Questions & Decisions Log
+## 7. Codified Dashboard & Analytics Mathematical Formulas (Decision F)
 
-The following decisions have been reviewed and structured for formal client sign-off:
+To prevent implementation ambiguity, all metrics for `FR-066` and `FR-067` are codified with exact mathematical definitions, boundary conditions, and timezone constraints:
 
-| # | Architecture / Product Decision | Audited Proposal & Recommendation | Technical Implications | Status |
-|---|---|---|---|:---:|
-| **Q1** | **Multi-Tenancy Workspace Routing** | **Path-based routing** (`/app/...` with active org context in secure cookie and header). | Eliminates wildcard DNS and SSL complexity in local Docker and production VPS. | **Pending Approval** |
-| **Q2** | **Project Visibility Within Organization** | **Private by default:** Only explicitly assigned `ProjectMember`s can view a project (plus Org Owner/Admin). | Enforces strict intra-company confidentiality across client teams. | **Pending Approval** |
-| **Q3** | **Kanban Card Ordering Strategy** | **Fractional Indexing (`Float`) with Automatic Rebalancing:** Cards spaced midway; rebalance when $\Delta < 10^{-6}$. | Delivers $O(1)$ fast drops without precision breakdown or large SQL updates. | **Pending Approval** |
-| **Q4** | **Subtask Hierarchy Depth** | **Single-level checklist items** (`Subtask` entity). | Satisfies 100% of MVP checklist requirements without complex recursive CTE queries. | **Pending Approval** |
-| **Q5** | **Guest Role Scope** | **Read-only on assigned tasks with commenting rights.** Cannot create tasks or change statuses. | Prevents external client stakeholders from corrupting internal sprint statuses. | **Pending Approval** |
-| **Q6** | **Notification Retention Policy** | **90-day retention with scheduled hard-delete.** | Prevents unbounded growth of the `Notification` table over time. | **Pending Approval** |
+### 7.1 Organization Dashboard Metrics (FR-066)
+1. **Total Projects:**
+   $$\text{Total Projects} = \text{COUNT}(\text{projects}) \quad \text{where } organizationId = :orgId \text{ AND } deletedAt \text{ IS NULL}$$
+2. **Active Projects:**
+   $$\text{Active Projects} = \text{COUNT}(\text{projects}) \quad \text{where } organizationId = :orgId \text{ AND } status = \text{'ACTIVE'} \text{ AND } deletedAt \text{ IS NULL}$$
+3. **Completed Projects:**
+   $$\text{Completed Projects} = \text{COUNT}(\text{projects}) \quad \text{where } organizationId = :orgId \text{ AND } status = \text{'COMPLETED'} \text{ AND } deletedAt \text{ IS NULL}$$
+4. **Task Completion Rate (%):**
+   $$\text{Completion Rate} = \begin{cases} 
+   0.0\%, & \text{if } \text{Eligible Tasks} = 0 \\
+   \left( \frac{\text{COUNT}(\text{tasks where } status = \text{'DONE'})}{\text{COUNT}(\text{tasks where } status \neq \text{'CANCELLED'})} \right) \times 100, & \text{otherwise}
+   \end{cases}$$
+   *Rule:* Soft-deleted tasks (`deletedAt IS NOT NULL`) are strictly excluded. `CANCELLED` tasks are excluded from both numerator and denominator so teams are not penalized for deprecated features. If denominator is 0, the metric returns `0.0%` (not `NaN` or division-by-zero error).
+5. **Overdue Tasks Count:**
+   $$\text{Overdue Tasks} = \text{COUNT}(\text{tasks}) \quad \text{where } organizationId = :orgId \text{ AND } dueDate < \text{NOW}() \text{ AND } status \notin (\text{'DONE'}, \text{'CANCELLED'}) \text{ AND } deletedAt \text{ IS NULL}$$
+   *Timezone Rule:* Date comparisons execute strictly in **UTC** at the database level (`NOW() AT TIME ZONE 'UTC'`).
+
+### 7.2 Project Dashboard Metrics (FR-067)
+1. **Project Progress (%):** Uses the identical formula as Completion Rate, scoped strictly to the target `projectId`.
+2. **Task Distribution by Status:** Returns integer counts grouped by status enum: `BACKLOG`, `TODO`, `IN_PROGRESS`, `IN_REVIEW`, `DONE`, `CANCELLED` (where `deletedAt IS NULL`).
+3. **Tasks by Priority:** Returns integer counts grouped by priority enum: `LOW`, `MEDIUM`, `HIGH`, `URGENT` (where `deletedAt IS NULL`).
+
+---
+
+## 8. Notification & Audit Log Retention Policies (Decision Q6)
+
+| Policy Dimension | In-App Notifications (`Notification` entity) | Security Audit Logs (`ActivityLog` entity) |
+|---|---|---|
+| **Retention Window** | **90 calendar days** from creation date. | **Permanent** (minimum 365 days; immutable). |
+| **Read vs. Unread** | Both read and unread notifications follow the identical 90-day retention rule. | N/A (append-only log). |
+| **Purge Mechanism** | Scheduled daily cron job (03:00 UTC) executing batch hard-deletion:  <br>`DELETE FROM notifications WHERE createdAt < NOW() - INTERVAL '90 days'` | Retention policy does NOT apply. Audit logs are never deleted or truncated by notification jobs. |
+| **Retry & Failure Handling** | If the scheduled purge fails, the worker logs an alert, tracks the error, and retries automatically on the next scheduled run. Batch chunking (5000 rows per transaction) prevents database lock contention. | Append-only. Modifying or deleting audit logs is strictly prohibited. |
+
+---
+
+## 9. Scope & Release Planning (MVP vs. Later Releases)
+
+The complete product vision is preserved, with clear milestone boundaries separating Release 1.0 (MVP) from subsequent releases:
+
+```mermaid
+gantt
+    title TeamFlow Phased Release Scope
+    dateFormat  YYYY-MM-DD
+    section Release 1.0 (MVP Core)
+    Auth, Sessions & Two-Tier RBAC :done, r1_1, 2026-11-01, 3d
+    Private Projects & Scoping :active, r1_2, after r1_1, 3d
+    Tasks & String Fractional Kanban :r1_3, after r1_2, 4d
+    Single-Level Checklists & DAG Dependencies :r1_4, after r1_3, 3d
+    Basic Comments & Immutable Audit Trail :r1_5, after r1_4, 3d
+    section Release 1.1 (Enhancements)
+    Attachments & S3 Storage Pipeline :r2_1, after r1_5, 3d
+    In-App Notification Center :r2_2, after r2_1, 3d
+    Dashboard Analytics & Redis Caching :r2_3, after r2_2, 3d
+    section Release 1.2 (Hardening)
+    Transactional Outbox Pattern for WebSockets :r3_1, after r2_3, 3d
+    Advanced Session Inspection & Revocation :r3_2, after r3_1, 2d
+    section Release 2.0+ (Enterprise)
+    Stripe Subscriptions & ClamAV Antivirus :r4_1, after r3_2, 5d
+    Gantt Charts & Native Mobile Apps :r4_2, after r4_1, 5d
+```
+
+### Scope Allocation Summary
+- **Release 1.0 (MVP Core):**
+  - Authentication, password hashing (Argon2id), session management.
+  - Organization creation, member invitations, and Two-Tier RBAC.
+  - Private projects by default and explicit project membership.
+  - Task CRUD, priorities, statuses, and single-level checklists.
+  - Interactive Kanban board with string-based fractional indexing (`orderKey`) and optimistic concurrency (`version`).
+  - Task dependency cycle detection ($A \rightarrow B \rightarrow A$ rejection).
+  - Basic task comments and immutable activity audit logs.
+- **Release 1.1 (Collaboration & Files):**
+  - S3/MinIO attachment pipeline with in-memory magic-byte validation and secure pre-signed downloads.
+  - In-app notification center dropdown with 90-day retention purge.
+  - Organization and project analytics dashboards with Redis cache invalidation.
+- **Release 1.2 (Reliability & Hardening):**
+  - Transactional Outbox Pattern for guaranteed real-time event publishing.
+  - Advanced session inspection UI with remote device revocation.
+  - Automatic column rebalancing trigger when key length exceeds 64 chars.
+- **Release 2.0+ (Enterprise & Commercial):**
+  - Stripe recurring subscriptions and seat billing.
+  - ClamAV antivirus scanning daemon for uploads.
+  - Interactive Gantt charts and critical path scheduling.
+  - Enterprise SAML / SSO / SCIM provisioning.
