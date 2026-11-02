@@ -1,5 +1,10 @@
 # TeamFlow — User Journeys & System Workflows
 
+**Document Version:** 1.1.0 (Audited & Reconciled)  
+**Specification Standard:** Aligned with IEEE 830 / ISO/IEC/IEEE 29148  
+**Audit Report:** [`requirements-review-report.md`](./requirements-review-report.md)  
+**Traceability Matrix:** [`traceability-matrix.md`](./traceability-matrix.md)
+
 This document models the critical user journeys, state transitions, and real-time interaction flows across the **TeamFlow** platform using formal software engineering sequence diagrams and state machines.
 
 ---
@@ -22,7 +27,7 @@ sequenceDiagram
     User->>Front: Fill Registration Form (Name, Email, Password)
     Front->>API: POST /api/v1/auth/register
     API->>AuthSvc: register(dto)
-    AuthSvc->>AuthSvc: Validate password complexity & Hash with Argon2id
+    AuthSvc->>AuthSvc: Validate password complexity & Hash with Argon2id ($m=65536, t=3, p=4$)
     AuthSvc->>DB: Check email uniqueness & Insert User (isEmailVerified=false)
     AuthSvc->>AuthSvc: Generate cryptographically secure Verification Token (24h TTL)
     AuthSvc->>DB: Store Verification Token
@@ -47,7 +52,7 @@ sequenceDiagram
     Front->>API: POST /api/v1/organizations { name: "Acme Corp" }
     API->>DB: BEGIN Transaction
     API->>DB: INSERT Organization (name, slug)
-    API->>DB: INSERT Membership (userId, orgId, role="OWNER")
+    API->>DB: INSERT Membership (userId, orgId, role="ORG_OWNER")
     API->>DB: INSERT ActivityLog (actorId, action="ORGANIZATION_CREATED")
     API->>DB: COMMIT Transaction
     API-->>Front: 201 Created (Sets active org cookie)
@@ -61,15 +66,17 @@ sequenceDiagram
 ### User Story
 > As an Organization Owner or Admin, I want to invite an employee to my workspace via email with a designated role, and have the system safely enroll them once accepted.
 
-### 2.1 Invitation State Lifecycle
+### 2.1 Reconciled Invitation State Lifecycle
 
 ```mermaid
 stateDiagram-v2
-    [*] --> PENDING: Org Admin invites email with Role
-    PENDING --> ACCEPTED: Invitee clicks link & accepts (email matches)
-    PENDING --> EXPIRED: 7 days elapse without acceptance
-    PENDING --> REVOKED: Org Admin cancels invitation
+    [*] --> PENDING: Org Admin invites email with target Role
+    PENDING --> ACCEPTED: Invitee clicks link & accepts (email matches account)
+    PENDING --> DECLINED: Invitee clicks decline button
+    PENDING --> EXPIRED: 7 days elapse without response
+    PENDING --> REVOKED: Org Admin actively cancels invitation
     ACCEPTED --> [*]
+    DECLINED --> [*]
     EXPIRED --> [*]
     REVOKED --> [*]
 ```
@@ -86,28 +93,35 @@ sequenceDiagram
     participant DB as PostgreSQL
     participant Mail as Mail Service
 
-    Admin->>Front: Invite "dev@acme.com" as "MEMBER"
+    Admin->>Front: Invite "dev@acme.com" as "ORG_MEMBER"
     Front->>API: POST /api/v1/organizations/:id/invitations
-    API->>API: Validate Admin has OWNER/ADMIN role in Org
+    API->>API: Validate Admin has ORG_OWNER or ORG_ADMIN role
     API->>DB: INSERT Invitation (email, role, token, expiresAt=now()+7d, status=PENDING)
-    API->>Mail: Send Invitation Email with accept link
+    API->>Mail: Send Invitation Email with accept/decline links
     API-->>Front: 201 Created (Invitation pending)
 
     Note over Invitee,Mail: Invitee receives email with link
 
-    Invitee->>Front: Open /invitations/accept?token=abc
-    Front->>API: POST /api/v1/organizations/invitations/accept { token }
-    API->>DB: Find Invitation by token where status=PENDING and expiresAt > now()
-    alt Invitee Email does not match Auth Account
-        API-->>Front: 403 Forbidden (Invite belongs to different email)
-    else Email matches
-        API->>DB: BEGIN Transaction
-        API->>DB: INSERT Membership (userId, orgId, role=invitation.role)
-        API->>DB: UPDATE Invitation SET status = 'ACCEPTED'
-        API->>DB: INSERT ActivityLog (actorId, action='MEMBER_JOINED')
-        API->>DB: COMMIT Transaction
-        API-->>Front: 200 OK (Membership confirmed)
-        Front-->>Invitee: Redirect to Organization Dashboard
+    alt Invitee Declines
+        Invitee->>Front: Click "Decline" (/invitations/decline?token=abc)
+        Front->>API: POST /api/v1/organizations/invitations/decline { token }
+        API->>DB: UPDATE Invitation SET status = 'DECLINED' where status = 'PENDING'
+        API-->>Front: 200 OK (Invitation declined)
+    else Invitee Accepts
+        Invitee->>Front: Open /invitations/accept?token=abc
+        Front->>API: POST /api/v1/organizations/invitations/accept { token }
+        API->>DB: Find Invitation by token where status=PENDING and expiresAt > now()
+        alt Invitee Email does not match Auth Account
+            API-->>Front: 403 Forbidden (Invite belongs to different email address)
+        else Email matches
+            API->>DB: BEGIN Transaction
+            API->>DB: INSERT Membership (userId, orgId, role=invitation.role)
+            API->>DB: UPDATE Invitation SET status = 'ACCEPTED'
+            API->>DB: INSERT ActivityLog (actorId, action='MEMBER_JOINED')
+            API->>DB: COMMIT Transaction
+            API-->>Front: 200 OK (Membership confirmed)
+            Front-->>Invitee: Redirect to Organization Dashboard
+        end
     end
 ```
 
@@ -116,38 +130,40 @@ sequenceDiagram
 ## 3. Journey 3: Project Creation & Member Scoping
 
 ### User Story
-> As a Project Manager, I want to create a new project and assign a specific subset of organization members so that sensitive projects remain strictly isolated from uninvolved staff.
+> As an Organization Member (or Admin), I want to create a new project and automatically be assigned as its Project Manager, then assign a specific subset of organization members so that sensitive client work remains strictly isolated.
 
 ```mermaid
 sequenceDiagram
     autonumber
-    actor PM as Project Manager
+    actor Creator as Org Member / Admin
+    actor Member as Assigned Colleague (David)
     participant Front as Next.js UI
     participant API as NestJS Projects Controller
-    participant Guard as Tenant & Role Guards
+    participant Guard as TenantGuard & ProjectGuard
     participant DB as PostgreSQL
     participant RT as Realtime Gateway
 
-    PM->>Front: Submit Create Project ("Mobile App v2", dates, description)
+    Creator->>Front: Submit Create Project ("Mobile App v2", dates, description)
     Front->>API: POST /api/v1/organizations/:orgId/projects
-    API->>Guard: Verify PM is active member of org with CREATE_PROJECT permission
+    API->>Guard: Verify Creator is active ORG_OWNER, ORG_ADMIN, or ORG_MEMBER
     Guard-->>API: Authorized
     API->>DB: BEGIN Transaction
     API->>DB: INSERT Project (orgId, title, status='PLANNING')
-    API->>DB: INSERT ProjectMember (projectId, userId=PM.id, role='PROJECT_MANAGER')
+    API->>DB: INSERT ProjectMember (projectId, userId=Creator.id, role='PROJECT_MANAGER')
+    API->>DB: INSERT ActivityLog (actorId=Creator.id, action='PROJECT_CREATED')
     API->>DB: COMMIT Transaction
-    API-->>Front: 201 Created (Project created)
+    API-->>Front: 201 Created (Creator is now Project Manager of Mobile App v2)
 
-    Note over PM,Front: Assigning Project Members
+    Note over Creator,Front: Assigning Team Members to Project
 
-    PM->>Front: Add Member (select "David", role="CONTRIBUTOR")
-    Front->>API: POST /api/v1/projects/:projectId/members { userId: "david_id" }
-    API->>Guard: Verify PM is assigned Manager of Project
-    API->>DB: Verify David is an active member of parent Organization
-    API->>DB: INSERT ProjectMember (projectId, userId, role)
+    Creator->>Front: Add Member (select "David", role="CONTRIBUTOR")
+    Front->>API: POST /api/v1/projects/:projectId/members { userId: "david_id", role: "CONTRIBUTOR" }
+    API->>Guard: Verify Creator is PROJECT_MANAGER of this Project (Layer 2 Check)
+    API->>DB: Verify David is active member of parent Organization (Layer 1 Check)
+    API->>DB: INSERT ProjectMember (projectId, userId=David.id, role='CONTRIBUTOR')
     API->>DB: INSERT Notification (recipient=David, type='PROJECT_ASSIGNED')
     API->>RT: Emit to David's personal room ("notification.created")
-    API-->>Front: 200 OK (Member added to project)
+    API-->>Front: 200 OK (David added to project)
 ```
 
 ---
@@ -157,26 +173,33 @@ sequenceDiagram
 ### User Story
 > As an engineer, I want to drag my task across columns on the Kanban board with instant visual feedback, having status changes persisted atomically and synced live to teammates.
 
-### 4.1 Task Status State Machine
+### 4.1 Reconciled Task Status & Blocker State Machine
+
+The task status enum contains strictly the 6 core operational states defined in the client specification. The "Blocked" condition is modeled dynamically based on unresolved dependencies.
 
 ```mermaid
 stateDiagram-v2
-    [*] --> BACKLOG: Created in backlog
+    [*] --> BACKLOG: Created in product backlog
     [*] --> TODO: Created directly in sprint
-    BACKLOG --> TODO: Sprint planning
-    TODO --> IN_PROGRESS: Developer starts work
+    BACKLOG --> TODO: Sprint planning triage
+    TODO --> IN_PROGRESS: Developer begins work
     IN_PROGRESS --> IN_REVIEW: Pull Request opened
-    IN_REVIEW --> IN_PROGRESS: Changes requested
-    IN_REVIEW --> DONE: Approved & merged
-    IN_PROGRESS --> BLOCKED: Dependency impediment
-    BLOCKED --> IN_PROGRESS: Blocker resolved
-    TODO --> CANCELLED: Deprecated
-    BACKLOG --> CANCELLED: Deprecated
+    IN_REVIEW --> IN_PROGRESS: Changes requested / review feedback
+    IN_REVIEW --> DONE: Code merged & verified
+    TODO --> CANCELLED: Feature deprecated
+    BACKLOG --> CANCELLED: Feature deprecated
     DONE --> [*]
     CANCELLED --> [*]
+
+    note right of IN_PROGRESS
+      Dynamic Attribute:
+      isBlocked = true
+      when unresolved TaskDependency exists.
+      Displays "Blocked" badge in UI.
+    end note
 ```
 
-### 4.2 Optimistic Drag-and-Drop Sequence with Concurrency Protection
+### 4.2 Optimistic Drag-and-Drop Sequence with Concurrency Protection & Rebalancing
 
 ```mermaid
 sequenceDiagram
@@ -192,41 +215,33 @@ sequenceDiagram
 
     Note over DevA,UI_A: Developer A drags Task #104 from "TODO" to "IN_PROGRESS"
     UI_A->>UI_A: Optimistic UI Update: Move card immediately in DOM
-    UI_A->>API: PATCH /api/v1/tasks/104/status { newStatus: "IN_PROGRESS", prevTaskId: 102, nextTaskId: 105 }
+    UI_A->>API: PATCH /api/v1/tasks/104/status { newStatus: "IN_PROGRESS", prevTaskId: 102, nextTaskId: 105, version: 3 }
     
-    API->>API: Verify Dev A is assigned member of parent Project
-    API->>API: Calculate new fractional orderIndex between Task 102 and Task 105
+    API->>API: Layer 1 & 2 Auth: Verify Dev A has CONTRIBUTOR or PM role in Project
+    API->>API: Calculate new fractional orderIndex: (prev.orderIndex + next.orderIndex) / 2
     
+    alt Precision Gap < 1e-6 (Precision Exhaustion)
+        API->>DB: Auto-Rebalance: Spacing cards in target column by 1000, 2000, 3000...
+    end
+
     API->>DB: BEGIN Transaction
-    API->>DB: UPDATE Task SET status = 'IN_PROGRESS', orderIndex = 4.5, updatedAt = now()
-    API->>DB: INSERT TaskStatusHistory (taskId=104, old='TODO', new='IN_PROGRESS', actor=DevA)
-    API->>DB: INSERT ActivityLog (actorId=DevA, action='TASK_STATUS_CHANGED')
-    API->>DB: COMMIT Transaction
+    API->>DB: UPDATE Task SET status = 'IN_PROGRESS', orderIndex = 4.5, version = 4 WHERE id = 104 AND version = 3
+    alt Version mismatch (Concurrent modification by another user)
+        API->>DB: ROLLBACK Transaction
+        API-->>UI_A: 409 Conflict { errorCode: "CONCURRENT_MODIFICATION" }
+        UI_A->>UI_A: Animate card back to previous position; toast "Task was modified by another user"
+    else Version matches
+        API->>DB: INSERT TaskStatusHistory (taskId=104, old='TODO', new='IN_PROGRESS', actor=DevA)
+        API->>DB: INSERT ActivityLog (actorId=DevA, action='TASK_STATUS_CHANGED')
+        API->>DB: COMMIT Transaction
 
-    API->>Redis: Publish ("project:10": "task.status_changed", payload)
-    API-->>UI_A: 200 OK { success: true, updatedTask }
+        API->>Redis: Publish ("project:10": "task.status_changed", payload)
+        API-->>UI_A: 200 OK { success: true, updatedTask }
 
-    Redis->>Gateway: Receive published event
-    Gateway->>UI_B: WebSocket emit("task.status_changed", payload)
-    UI_B->>UI_B: Animate Task #104 moving to "IN_PROGRESS" column without page refresh
-```
-
-### 4.3 Error / Rejection Rollback Sequence
-
-```mermaid
-sequenceDiagram
-    autonumber
-    actor Dev as Developer
-    participant UI as Browser (Kanban)
-    participant API as NestJS API
-
-    Dev->>UI: Drag Task to "DONE"
-    UI->>UI: Optimistically drop card into "DONE" column
-    UI->>API: PATCH /api/v1/tasks/104/status { newStatus: "DONE" }
-    API->>API: Evaluation: Task has unresolved blocking dependency (Task #101 is TODO)
-    API-->>UI: 400 Bad Request { error: "TASK_HAS_UNRESOLVED_DEPENDENCY", message: "Task 101 must be completed first." }
-    UI->>UI: ROLLBACK: Animate card back to original column ("TODO")
-    UI->>Dev: Display error toast notification ("Cannot complete task: blocked by Task #101")
+        Redis->>Gateway: Receive published event
+        Gateway->>UI_B: WebSocket emit("task.status_changed", payload)
+        UI_B->>UI_B: Animate Task #104 moving to "IN_PROGRESS" column without page refresh
+    end
 ```
 
 ---
@@ -250,10 +265,11 @@ sequenceDiagram
     Commenter->>Front_A: Type comment: "Great progress @david, please review the PR"
     Front_A->>API: POST /api/v1/tasks/104/comments { content: "Great progress @david..." }
     
+    API->>API: Sanitize markdown HTML with DOMPurify
     API->>API: Parse mentions: found ["@david"]
-    API->>API: Verify David is member of Project
+    API->>API: Layer 2 Check: Verify David is active member of Project
     
-    API->>API: Save Comment & create Notification records in DB
+    API->>API: Save Comment & create Notification records in DB (90-day retention)
     API->>EventBus: emit("comment.created", { comment, taskId, projectId, mentions })
     API-->>Front_A: 201 Created (Comment posted)
 
@@ -267,4 +283,3 @@ sequenceDiagram
         Gateway-->>Front_D: Increment unread bell counter & display Toast: "Alex mentioned you in Task #104"
     end
 ```
-
