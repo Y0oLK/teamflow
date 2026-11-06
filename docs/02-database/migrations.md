@@ -288,3 +288,4 @@ Prisma Migrate does not generate automatic `down` migrations to prevent accident
 2. **Point-In-Time-Recovery (Disaster Recovery):**
    - TeamFlow utilizes PostgreSQL Write-Ahead Log (WAL) archiving combined with daily base backups (`pg_dump` / Barman / AWS RDS snapshots).
    - In case of catastrophic data corruption, the database is restored to the exact minute prior to the failed deployment.
+

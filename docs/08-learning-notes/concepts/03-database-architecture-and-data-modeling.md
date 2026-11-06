@@ -532,3 +532,4 @@ flowchart LR
 > However, failing to index foreign key columns causes severe performance degradation in two scenarios:
 > 1. **Parent-Child Joins:** Queries joining `Project` and `Task` (`WHERE task.projectId = project.id`) will perform full sequential table scans on `Task` instead of an efficient index scan.
 > 2. **Cascading Deletions / Updates:** When a row in the parent table (`Project`) is deleted or updated, PostgreSQL must scan the child table (`Task`) to verify referential integrity. Without an index on `Task.projectId`, PostgreSQL is forced to perform a sequential scan of the entire `Task` table, taking shared table locks that can cause severe transaction timeouts and system-wide lock queues."
+

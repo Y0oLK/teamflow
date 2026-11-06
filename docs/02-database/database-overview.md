@@ -121,3 +121,4 @@ To ensure optimal storage efficiency, memory alignment, and query performance in
 | **Timestamps** | `TIMESTAMP WITH TIME ZONE` (`TIMESTAMPTZ`) | **Mandatory UTC.** Prevents timezone ambiguities across international teams. |
 | **Audit Metadata** | `JSONB` | Binary JSON supporting GIN indexing and fast key-value lookups for event metadata. |
 | **File Sizes** | `BIGINT` | Supports 64-bit byte representations without 32-bit integer overflow. |
+

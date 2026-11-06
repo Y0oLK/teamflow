@@ -153,3 +153,4 @@ flowchart TD
   - `EXPLAIN (ANALYZE, BUFFERS)` execution time $< 15\text{ ms}$.
   - Zero `Seq Scan` on primary tables.
   - Zero `Sort` nodes on board aggregation queries.
+

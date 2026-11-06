@@ -441,3 +441,4 @@ flowchart TD
 | **`P2025`** | `N/A` | Record not found or OCC version mismatch during update | Catch error, trigger stale state workflow | `409 Conflict` or `404 Not Found` |
 | **`P2034`** | `40P01` / `40001` | Transaction failed due to deadlock or write conflict | Retry transaction with exponential backoff (up to 3 times) | `503 Service Unavailable` (if retries exhausted) |
 | **`P2028`** | `N/A` | Transaction timeout reached | Log alert, inspect query execution time | `504 Gateway Timeout` |
+

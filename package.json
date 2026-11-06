@@ -1,0 +1,30 @@
+{
+  "name": "teamflow-monorepo",
+  "version": "1.0.0",
+  "private": true,
+  "description": "TeamFlow — Multi-tenant SaaS Project Management Platform",
+  "author": "TeamFlow Engineering Team",
+  "license": "UNLICENSED",
+  "workspaces": [
+    "apps/*",
+    "packages/*"
+  ],
+  "scripts": {
+    "build": "npm run --workspaces --if-present build",
+    "lint": "npm run --workspaces --if-present lint",
+    "test": "npm run --workspaces --if-present test",
+    "api": "npm run start:dev --workspace=apps/api",
+    "docker:up": "docker compose up -d",
+    "docker:down": "docker compose down",
+    "docker:logs": "docker compose logs -f",
+    "prisma:generate": "npm run prisma:generate --workspace=apps/api",
+    "prisma:migrate": "npm run prisma:migrate --workspace=apps/api",
+    "prisma:seed": "npm run prisma:seed --workspace=apps/api",
+    "prisma:studio": "npm run prisma:studio --workspace=apps/api"
+  },
+  "engines": {
+    "node": ">=20.0.0",
+    "npm": ">=10.0.0"
+  }
+}
+

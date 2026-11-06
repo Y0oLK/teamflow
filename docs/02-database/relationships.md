@@ -126,3 +126,4 @@ flowchart TD
    WHERE organization_id = :orgId AND role = 'ORG_OWNER';
    ```
    If count $\le 1$, the operation is rejected with HTTP 400 `LAST_OWNER_CANNOT_BE_REMOVED`.
+

@@ -1,0 +1,54 @@
+version: '3.8'
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    container_name: teamflow-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-teamflow_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-teamflow_password}
+      POSTGRES_DB: ${POSTGRES_DB:-teamflow_db}
+      PGDATA: /var/lib/postgresql/data/pgdata
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-teamflow_user} -d ${POSTGRES_DB:-teamflow_db}"]
+      interval: 5s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks:
+      - teamflow_network
+
+  redis:
+    image: redis:7-alpine
+    container_name: teamflow-redis
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+    networks:
+      - teamflow_network
+
+volumes:
+  postgres_data:
+    name: teamflow_postgres_data
+  redis_data:
+    name: teamflow_redis_data
+
+networks:
+  teamflow_network:
+    name: teamflow_network
+    driver: bridge
+

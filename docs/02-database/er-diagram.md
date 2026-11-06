@@ -282,3 +282,4 @@ erDiagram
 | | `Attachment` | Metadata for files stored in S3/MinIO. | ✅ | ✅ |
 | **System Operations** | `Notification` | In-app user alerts with 90-day retention purge. | ✅ | ❌ (90-day Purge) |
 | | `ActivityLog` | Immutable audit trail for security and business events (365-day retention). | ✅ | ❌ (Immutable) |
+
