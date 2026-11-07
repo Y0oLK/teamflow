@@ -18,3 +18,4 @@ export class InviteMemberDto {
   @IsEnum(OrgRole, { message: 'Invalid organization role' })
   role?: OrgRole;
 }
+

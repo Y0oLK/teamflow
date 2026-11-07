@@ -38,3 +38,4 @@ export class RegisterDto {
   @Transform(({ value }: { value: string }) => value?.trim())
   lastName!: string;
 }
+

@@ -23,3 +23,4 @@ export class UpdateProfileDto {
   @MaxLength(512)
   avatarUrl?: string;
 }
+

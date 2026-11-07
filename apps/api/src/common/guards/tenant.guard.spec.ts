@@ -89,3 +89,4 @@ describe('TenantGuard (Multi-Tenant Isolation Engine)', () => {
     await expect(guard.canActivate(context)).rejects.toThrow(ForbiddenException);
   });
 });
+

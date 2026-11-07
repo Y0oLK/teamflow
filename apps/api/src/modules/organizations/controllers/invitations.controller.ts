@@ -27,3 +27,4 @@ export class InvitationsController {
     return this.invitationsService.acceptInvitation(user.id, user.email, dto);
   }
 }
+

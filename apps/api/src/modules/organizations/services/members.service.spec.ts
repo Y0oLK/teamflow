@@ -23,6 +23,7 @@ describe('MembersService', () => {
       activityLog: {
         create: jest.fn(),
       },
+      $queryRaw: jest.fn().mockResolvedValue([{ id: 'org1' }]),
       $transaction: jest.fn().mockImplementation(async (callback) => callback(mockPrisma)),
     };
 
@@ -105,6 +106,45 @@ describe('MembersService', () => {
         )
       ).rejects.toThrow(ForbiddenException);
     });
+
+    it('CONCURRENCY AUDIT: should prevent race condition when two requests try to demote owners simultaneously', async () => {
+      // Simulate two owners initially in the organization
+      let ownersRemaining = 2;
+
+      mockPrisma.membership.findUnique.mockImplementation(async ({ where }: { where: { id: string } }) => {
+        return {
+          id: where.id,
+          organizationId: 'org1',
+          userId: where.id === 'mem1' ? 'user1' : 'user2',
+          role: OrgRole.ORG_OWNER,
+          user: { id: 'u', email: 'test@test.com', firstName: 'A', lastName: 'B', avatarUrl: null },
+        };
+      });
+
+      // Count returns current remaining owners locked by the transaction
+      mockPrisma.membership.count.mockImplementation(async () => ownersRemaining);
+
+      mockPrisma.membership.update.mockImplementation(async () => {
+        ownersRemaining -= 1; // First demotion committed
+        return {
+          id: 'mem1',
+          userId: 'user1',
+          role: OrgRole.ORG_MEMBER,
+          createdAt: new Date(),
+          user: { id: 'u', email: 'test@test.com', firstName: 'A', lastName: 'B', avatarUrl: null },
+        };
+      });
+
+      // Request 1 (acquires lock first): demotes mem1, drops owner count to 1
+      const req1 = await service.updateMemberRole('org1', 'user2', OrgRole.ORG_OWNER, 'mem1', OrgRole.ORG_MEMBER);
+      expect(req1.role).toBe(OrgRole.ORG_MEMBER);
+      expect(mockPrisma.$queryRaw).toHaveBeenCalled();
+
+      // Request 2 (queued behind row lock): now sees ownerCount == 1, must be rejected
+      await expect(
+        service.updateMemberRole('org1', 'user1', OrgRole.ORG_OWNER, 'mem2', OrgRole.ORG_MEMBER)
+      ).rejects.toThrow(BadRequestException);
+    });
   });
 
   describe('removeMember', () => {
@@ -145,3 +185,4 @@ describe('MembersService', () => {
     });
   });
 });
+

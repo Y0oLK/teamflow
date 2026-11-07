@@ -12,3 +12,4 @@ export class UpdateMemberRoleDto {
   @IsEnum(OrgRole, { message: 'Invalid organization role' })
   role!: OrgRole;
 }
+

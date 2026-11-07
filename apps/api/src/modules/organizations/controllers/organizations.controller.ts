@@ -175,3 +175,4 @@ export class OrganizationsController {
     return this.invitationsService.revokeInvitation(tenant.id, user.id, invId);
   }
 }
+

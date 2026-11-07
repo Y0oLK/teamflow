@@ -23,3 +23,4 @@ export class CreateOrganizationDto {
   @Transform(({ value }: { value: string | undefined }) => value?.trim().toLowerCase())
   slug?: string;
 }
+

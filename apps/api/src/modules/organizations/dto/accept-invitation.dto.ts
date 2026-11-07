@@ -7,3 +7,4 @@ export class AcceptInvitationDto {
   @IsNotEmpty({ message: 'Invitation token is required' })
   token!: string;
 }
+

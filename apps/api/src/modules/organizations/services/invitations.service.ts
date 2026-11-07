@@ -215,21 +215,28 @@ export class InvitationsService {
 
     // Atomic transaction for invitation acceptance (TX-03)
     await this.prisma.$transaction(async (tx) => {
-      // 1. Create Membership
+      // 1. Atomically consume the invitation only if still PENDING (prevents concurrent double-acceptance)
+      const updateResult = await tx.invitation.updateMany({
+        where: {
+          id: invitation.id,
+          status: InvitationStatus.PENDING,
+        },
+        data: {
+          status: InvitationStatus.ACCEPTED,
+          acceptedAt: new Date(),
+        },
+      });
+
+      if (updateResult.count === 0) {
+        throw new ConflictException('Invitation has already been accepted or is no longer valid.');
+      }
+
+      // 2. Create Membership
       await tx.membership.create({
         data: {
           organizationId: invitation.organizationId,
           userId,
           role: invitation.role,
-        },
-      });
-
-      // 2. Mark Invitation as ACCEPTED
-      await tx.invitation.update({
-        where: { id: invitation.id },
-        data: {
-          status: InvitationStatus.ACCEPTED,
-          acceptedAt: new Date(),
         },
       });
 
@@ -274,3 +281,4 @@ export class InvitationsService {
     return { message: 'Invitation revoked successfully' };
   }
 }
+

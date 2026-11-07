@@ -131,3 +131,4 @@ sequenceDiagram
 > 1. **Route Gateway Layer:** Our `TenantGuard` intercepts requests containing `:orgId` parameters or `X-Organization-Id` headers. It queries the `Membership` table to verify that the authenticated user has an active membership in that organization. If unauthorized, it terminates the request with a `403 Forbidden` before the controller is reached.
 > 2. **Request Context Layer:** `TenantGuard` extracts the verified organization ID and attaches it directly to `req.tenant` and `req.user.currentOrgId`.
 > 3. **Service & Database Layer:** Service methods reject client-supplied tenant IDs in request bodies and bind database operations exclusively to the server-verified `organizationId` from the context. Furthermore, composite unique constraints at the database level (`UNIQUE (organizationId, key)`) ensure that data integrity is physically enforced by PostgreSQL."
+

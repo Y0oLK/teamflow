@@ -16,3 +16,4 @@ export class UpdateOrganizationDto {
   @MaxLength(512)
   avatarUrl?: string;
 }
+
