@@ -224,3 +224,4 @@ Four security and concurrency vulnerabilities were identified, remediated, verif
 | **Members & Sole Owner** | [`members.service.spec.ts`](../../apps/api/src/modules/organizations/services/members.service.spec.ts) | Unit (Concurrency) | 8 | **PASSED** |
 | **Invitations Service** | [`invitations.service.spec.ts`](../../apps/api/src/modules/organizations/services/invitations.service.spec.ts) | Unit (Concurrency) | 5 | **PASSED** |
 | **Total** | **9 Test Suites** | **Unit** | **50 Tests** | **ALL PASSED** |
+
